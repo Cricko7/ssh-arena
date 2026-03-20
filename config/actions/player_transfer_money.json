@@ -1,0 +1,26 @@
+{
+  "id": "player.transfer_money",
+  "version": 1,
+  "route": "wallets",
+  "display_name": "PlayerTransferMoney",
+  "requires_auth": true,
+  "idempotent": true,
+  "cooldown_ms": 0,
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "to_player_id",
+      "amount"
+    ],
+    "properties": {
+      "to_player_id": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "amount": {
+        "type": "integer",
+        "minimum": 1
+      }
+    }
+  }
+}

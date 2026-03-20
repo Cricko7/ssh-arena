@@ -1,0 +1,76 @@
+{
+  "tickers": [
+    {
+      "symbol": "TECH",
+      "name": "TechCore Systems",
+      "sector": "technology",
+      "initial_price": 1000,
+      "tick_size": 5,
+      "liquidity_units": 18000,
+      "whale_threshold": 4500
+    },
+    {
+      "symbol": "ENERGY",
+      "name": "GridFuel Energy",
+      "sector": "energy",
+      "initial_price": 920,
+      "tick_size": 5,
+      "liquidity_units": 17000,
+      "whale_threshold": 4200
+    },
+    {
+      "symbol": "FOOD",
+      "name": "FreshLoop Foods",
+      "sector": "consumer",
+      "initial_price": 740,
+      "tick_size": 5,
+      "liquidity_units": 16000,
+      "whale_threshold": 3900
+    },
+    {
+      "symbol": "CRYPTO",
+      "name": "ChainForge Capital",
+      "sector": "digital-assets",
+      "initial_price": 1500,
+      "tick_size": 10,
+      "liquidity_units": 14000,
+      "whale_threshold": 3200
+    },
+    {
+      "symbol": "DEFENSE",
+      "name": "Aegis Arsenal",
+      "sector": "defense",
+      "initial_price": 1120,
+      "tick_size": 5,
+      "liquidity_units": 15000,
+      "whale_threshold": 3600
+    },
+    {
+      "symbol": "PHARMA",
+      "name": "NovaCure Pharma",
+      "sector": "healthcare",
+      "initial_price": 860,
+      "tick_size": 5,
+      "liquidity_units": 15500,
+      "whale_threshold": 3500
+    },
+    {
+      "symbol": "ENTERTAINMENT",
+      "name": "StarPulse Media",
+      "sector": "entertainment",
+      "initial_price": 690,
+      "tick_size": 5,
+      "liquidity_units": 14500,
+      "whale_threshold": 3300
+    },
+    {
+      "symbol": "TRANSPORT",
+      "name": "SkyRail Transit",
+      "sector": "transport",
+      "initial_price": 810,
+      "tick_size": 5,
+      "liquidity_units": 15000,
+      "whale_threshold": 3400
+    }
+  ]
+}

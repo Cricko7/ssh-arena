@@ -1,0 +1,12 @@
+{
+  "id": "market.crash",
+  "version": 1,
+  "description": "Temporary crash event for a single market symbol",
+  "trigger": "admin|scheduler|simulation",
+  "handler": "market_crash.Handler",
+  "impact": {
+    "symbol": "GOLD",
+    "bps_drop": 1800,
+    "duration_seconds": 120
+  }
+}

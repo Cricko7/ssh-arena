@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  grpc-game:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ssh-arena:dev
+    command: ["/app/docker/entrypoint-grpc.sh"]
+    environment:
+      GRPC_LISTEN_ADDR: ":9090"
+      REDIS_ADDR: "redis:6379"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - redis
+      - postgres
+
+  ssh-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ssh-arena:dev
+    command: ["/app/docker/entrypoint-ssh.sh"]
+    environment:
+      SSH_LISTEN_ADDR: ":2222"
+      SSH_HOST_KEY_PATH: "/var/lib/ssh-arena/ssh/ssh_host_ed25519"
+    ports:
+      - "2222:2222"
+    volumes:
+      - ssh-host-keys:/var/lib/ssh-arena/ssh
+    depends_on:
+      - grpc-game
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ssharena
+      POSTGRES_USER: ssharena
+      POSTGRES_PASSWORD: ssharena
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:
+  ssh-host-keys:
