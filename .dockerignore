@@ -1,9 +1,13 @@
 .git
 .gitignore
-bin
+*.md
+Makefile
+vendor/
+bin/
 out
 .tmp
 coverage.out
 *.log
-.vscode
-.idea
+.env
+.idea/
+.vscode/
