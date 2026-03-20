@@ -1,0 +1,16 @@
+{
+  "id": "chat.send",
+  "version": 1,
+  "route": "chat",
+  "display_name": "SendChatMessage",
+  "requires_auth": true,
+  "idempotent": false,
+  "cooldown_ms": 250,
+  "input_schema": {
+    "type": "object",
+    "required": ["body"],
+    "properties": {
+      "body": {"type": "string", "minLength": 1, "maxLength": 500}
+    }
+  }
+}

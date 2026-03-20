@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package game.v1;
+
+option go_package = "github.com/aeza/ssh-arena/gen/game/v1;gamev1";
+
+message JsonEnvelope {
+  string topic = 1;
+  string json = 2;
+  int64 sequence = 3;
+}
+
+message PlayerBootstrapRequest {
+  string ssh_username = 1;
+  string public_key_fingerprint = 2;
+  string remote_addr = 3;
+}
+
+message PlayerBootstrapResponse {
+  string player_id = 1;
+  string role = 2;
+  bool created = 3;
+  string bootstrap_json = 4;
+}
+
+message ActionRequest {
+  string request_id = 1;
+  string player_id = 2;
+  string action_id = 3;
+  string payload_json = 4;
+  map<string, string> metadata = 5;
+}
+
+message ActionResponse {
+  string request_id = 1;
+  string action_id = 2;
+  string status = 3;
+  string response_json = 4;
+}
+
+message MarketStreamRequest {
+  string player_id = 1;
+  repeated string symbols = 2;
+  bool include_orderbook = 3;
+  bool include_trades = 4;
+  bool include_portfolio = 5;
+  bool include_chat = 6;
+}
+
+message ChatRequest {
+  string player_id = 1;
+  string json = 2;
+}
+
+message ChartSubscriptionRequest {
+  string player_id = 1;
+  string ticker = 2;
+  uint32 history_limit = 3;
+  uint32 orderbook_depth = 4;
+}
+
+message PriceChartTick {
+  string ticker = 1;
+  string json = 2;
+  int64 sequence = 3;
+}
+
+service AccountService {
+  rpc EnsurePlayer(PlayerBootstrapRequest) returns (PlayerBootstrapResponse);
+}
+
+service GameService {
+  rpc ExecuteAction(ActionRequest) returns (ActionResponse);
+  rpc GetMarketStream(stream MarketStreamRequest) returns (stream JsonEnvelope);
+  rpc SubscribeToChart(stream ChartSubscriptionRequest) returns (stream PriceChartTick);
+}
+
+service ChatService {
+  rpc SendChat(ChatRequest) returns (JsonEnvelope);
+  rpc StreamChat(MarketStreamRequest) returns (stream JsonEnvelope);
+}

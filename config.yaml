@@ -1,0 +1,3 @@
+chart_tick_interval_seconds: 3
+chart_history_points: 240
+chart_orderbook_depth: 10

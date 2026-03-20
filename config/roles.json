@@ -1,0 +1,31 @@
+{
+  "Buyer": {
+    "cash": 350000,
+    "variance_pct": 8,
+    "base_holdings": {
+      "*": 8
+    }
+  },
+  "Holder": {
+    "cash": 120000,
+    "variance_pct": 10,
+    "base_holdings": {
+      "*": 55,
+      "TECH": 70,
+      "CRYPTO": 65,
+      "ENERGY": 60
+    }
+  },
+  "Whale": {
+    "cash": 2500000,
+    "variance_pct": 12,
+    "whale_influence_bps": 15000,
+    "base_holdings": {
+      "*": 220,
+      "TECH": 300,
+      "CRYPTO": 280,
+      "ENERGY": 260,
+      "DEFENSE": 250
+    }
+  }
+}
