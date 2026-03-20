@@ -119,6 +119,94 @@ func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceO
 	}, nil
 }
 
+func (s *Service) TriggerMarketEvent(ctx context.Context, input EventShockInput) (EventShockOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	occurredAt := input.OccurredAt
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+
+	affected := make([]string, 0, len(s.tickers))
+	if input.Global {
+		for symbol := range s.tickers {
+			affected = append(affected, symbol)
+		}
+	} else {
+		if _, ok := s.tickers[input.Symbol]; !ok {
+			return EventShockOutput{}, fmt.Errorf("unsupported symbol %q", input.Symbol)
+		}
+		affected = append(affected, input.Symbol)
+	}
+
+	prices := make(map[string]PricePoint, len(affected))
+	cachePayloads := make(map[string]string, len(affected))
+	for _, symbol := range affected {
+		price, err := s.priceEngine.TriggerShock(symbol, input.MultiplierPct, input.Duration, occurredAt)
+		if err != nil {
+			return EventShockOutput{}, err
+		}
+		prices[symbol] = price
+
+		if s.cache != nil {
+			book := s.books[symbol]
+			snapshot := book.Snapshot(10)
+			recentTrades := append([]orderbook.Trade(nil), s.recentTrades[symbol]...)
+			jsonPayload, marshalErr := MarshalEnvelope("market.snapshot", map[string]any{
+				"orderbook":     snapshot,
+				"price":         price,
+				"recent_trades": recentTrades,
+			})
+			if marshalErr == nil {
+				cachePayloads[symbol] = jsonPayload
+			}
+		}
+	}
+
+	payload := map[string]any{
+		"name":             input.EventName,
+		"message":          input.Message,
+		"global":           input.Global,
+		"symbol":           input.Symbol,
+		"affected_symbols": affected,
+		"multiplier_pct":   input.MultiplierPct,
+		"duration_seconds": int(input.Duration.Seconds()),
+		"prices":           prices,
+		"occurred_at":      occurredAt,
+	}
+	jsonPayload, err := MarshalEnvelope("market.event", payload)
+	if err != nil {
+		return EventShockOutput{}, err
+	}
+
+	if s.cache != nil {
+		for symbol, payload := range cachePayloads {
+			_ = s.cache.PutSnapshot(ctx, symbol, payload)
+			_ = s.cache.Publish(ctx, "arena.market."+symbol, payload)
+		}
+		_ = s.cache.Publish(ctx, "arena.events", jsonPayload)
+	}
+	if s.chat != nil {
+		_, _ = s.chat.Broadcast(ctx, chat.Message{
+			Type:     "system.event",
+			Channel:  "global",
+			PlayerID: "system",
+			Username: "market-bot",
+			Role:     "System",
+			Body:     input.Message,
+			SentAt:   occurredAt,
+		})
+	}
+
+	return EventShockOutput{
+		JSON:            jsonPayload,
+		AffectedSymbols: affected,
+		Prices:          prices,
+		OccurredAt:      occurredAt,
+	}, nil
+}
+
 func (s *Service) SnapshotJSON(symbol string, depth int) (string, error) {
 	snapshot, err := s.ChartSnapshot(symbol, depth)
 	if err != nil {

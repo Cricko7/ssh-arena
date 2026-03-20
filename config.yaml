@@ -2,3 +2,5 @@ chart_tick_interval_seconds: 3
 chart_history_points: 240
 chart_orderbook_depth: 10
 player_state_path: data/players.json
+random_event_interval_seconds: 15
+random_events_path: events/random_events.json

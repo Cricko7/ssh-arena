@@ -70,6 +70,23 @@ type ChartSnapshot struct {
 	CapturedAt   time.Time          `json:"captured_at"`
 }
 
+type EventShockInput struct {
+	EventName     string
+	Message       string
+	Global        bool
+	Symbol        string
+	MultiplierPct int
+	Duration      time.Duration
+	OccurredAt    time.Time
+}
+
+type EventShockOutput struct {
+	JSON            string                `json:"json"`
+	AffectedSymbols []string              `json:"affected_symbols"`
+	Prices          map[string]PricePoint `json:"prices"`
+	OccurredAt      time.Time             `json:"occurred_at"`
+}
+
 func MarshalEnvelope(kind string, payload any) (string, error) {
 	raw, err := json.Marshal(map[string]any{
 		"type":    kind,

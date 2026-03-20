@@ -12,6 +12,8 @@ type RuntimeConfig struct {
 	ChartHistoryPoints       int    `yaml:"chart_history_points"`
 	ChartOrderbookDepth      int    `yaml:"chart_orderbook_depth"`
 	PlayerStatePath          string `yaml:"player_state_path"`
+	RandomEventIntervalSecs  int    `yaml:"random_event_interval_seconds"`
+	RandomEventsPath         string `yaml:"random_events_path"`
 }
 
 func DefaultRuntimeConfig() RuntimeConfig {
@@ -20,6 +22,8 @@ func DefaultRuntimeConfig() RuntimeConfig {
 		ChartHistoryPoints:       240,
 		ChartOrderbookDepth:      10,
 		PlayerStatePath:          "data/players.json",
+		RandomEventIntervalSecs:  15,
+		RandomEventsPath:         "events/random_events.json",
 	}
 }
 
@@ -46,6 +50,12 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 	}
 	if cfg.PlayerStatePath == "" {
 		cfg.PlayerStatePath = "data/players.json"
+	}
+	if cfg.RandomEventIntervalSecs <= 0 {
+		cfg.RandomEventIntervalSecs = 15
+	}
+	if cfg.RandomEventsPath == "" {
+		cfg.RandomEventsPath = "events/random_events.json"
 	}
 	return cfg, nil
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/aeza/ssh-arena/internal/chat"
 	"github.com/aeza/ssh-arena/internal/config"
 	"github.com/aeza/ssh-arena/internal/exchange"
+	"github.com/aeza/ssh-arena/internal/marketevents"
 	"github.com/aeza/ssh-arena/internal/roles"
 )
 
@@ -37,6 +38,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	eventDefs, err := marketevents.LoadDefinitions(runtimeConfig.RandomEventsPath)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	chatService := chat.NewService(128)
 	var cache exchange.Cache
@@ -53,6 +58,14 @@ func main() {
 	}, exchangeService)
 	chartEngine.Start(ctx)
 
+	randomEvents, err := marketevents.NewEngine(marketevents.Config{
+		Interval: time.Duration(runtimeConfig.RandomEventIntervalSecs) * time.Second,
+	}, eventDefs, exchangeService)
+	if err != nil {
+		log.Fatal(err)
+	}
+	randomEvents.Start(ctx)
+
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
@@ -63,7 +76,7 @@ func main() {
 	reflection.Register(server)
 
 	log.Printf("grpc game service listening on %s", addr)
-	log.Printf("exchange core ready: tickers=%d roles=%T chart_interval=%ds chart_history=%d chart_depth=%d cache_enabled=%t service=%T", len(tickers), allocator, runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, cache != nil, exchangeService)
+	log.Printf("exchange core ready: tickers=%d roles=%T chart_interval=%ds chart_history=%d chart_depth=%d random_event_interval=%ds random_events=%d cache_enabled=%t service=%T", len(tickers), allocator, runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, runtimeConfig.RandomEventIntervalSecs, len(eventDefs), cache != nil, exchangeService)
 	if err := server.Serve(lis); err != nil {
 		log.Fatal(err)
 	}

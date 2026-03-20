@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: ssh-arena:dev
-    command: ["/app/docker/entrypoint-grpc.sh"]
+    command: ["/app/bin/grpc-game"]
     environment:
       GRPC_LISTEN_ADDR: ":9090"
       REDIS_ADDR: "redis:6379"
@@ -29,7 +29,15 @@ services:
       context: .
       dockerfile: Dockerfile
     image: ssh-arena:dev
-    command: ["/app/docker/entrypoint-ssh.sh"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p "$(dirname "$SSH_HOST_KEY_PATH")"
+        if [ ! -f "$SSH_HOST_KEY_PATH" ]; then
+          ssh-keygen -t ed25519 -f "$SSH_HOST_KEY_PATH" -N '' >/dev/null
+        fi
+        exec /app/bin/ssh-server
     environment:
       SSH_LISTEN_ADDR: ":2222"
       SSH_HOST_KEY_PATH: "/var/lib/ssh-arena/ssh/ssh_host_ed25519"

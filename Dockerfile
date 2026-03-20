@@ -21,10 +21,8 @@ COPY --from=build /out/ssh-server /app/bin/ssh-server
 COPY config /app/config
 COPY events /app/events
 COPY config.yaml /app/config.yaml
-COPY docker /app/docker
 
 RUN adduser -D -g '' appuser \
-    && chmod +x /app/docker/*.sh \
     && mkdir -p /var/lib/ssh-arena/ssh \
     && chown -R appuser:appuser /app /var/lib/ssh-arena
 

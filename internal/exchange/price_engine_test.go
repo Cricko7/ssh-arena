@@ -41,3 +41,14 @@ func TestPriceEngineMeanRevertsWithoutTrades(t *testing.T) {
 		t.Fatalf("expected idle market to mean-revert from spike, got %d", price.CurrentPrice)
 	}
 }
+
+func TestPriceEngineTriggerShockMovesMarket(t *testing.T) {
+	engine := NewPriceEngine([]Ticker{{Symbol: "TECH", InitialPrice: 1000, TickSize: 5, LiquidityUnits: 1000, WhaleThreshold: 100}})
+	price, err := engine.TriggerShock("TECH", 15, 45*time.Second, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("TriggerShock: %v", err)
+	}
+	if price.CurrentPrice <= 1000 {
+		t.Fatalf("expected positive event shock to lift price, got %d", price.CurrentPrice)
+	}
+}
