@@ -37,6 +37,7 @@ services:
       - "2222:2222"
     volumes:
       - ssh-host-keys:/var/lib/ssh-arena/ssh
+      - game-data:/app/data
     depends_on:
       - grpc-game
     restart: unless-stopped
@@ -67,3 +68,4 @@ services:
 volumes:
   postgres-data:
   ssh-host-keys:
+  game-data:

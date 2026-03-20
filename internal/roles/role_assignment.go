@@ -3,8 +3,12 @@ package roles
 import (
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
+	"math"
+	"math/rand"
 	"os"
+	"sort"
+	"sync"
+	"time"
 )
 
 type Role string
@@ -42,10 +46,19 @@ type Assignment struct {
 
 type Allocator struct {
 	config Config
+	mu     sync.Mutex
+	rng    *rand.Rand
 }
 
 func NewAllocator(config Config) *Allocator {
-	return &Allocator{config: config}
+	return NewAllocatorWithSeed(config, time.Now().UnixNano())
+}
+
+func NewAllocatorWithSeed(config Config, seed int64) *Allocator {
+	return &Allocator{
+		config: config,
+		rng:    rand.New(rand.NewSource(seed)),
+	}
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -61,34 +74,39 @@ func LoadConfig(path string) (Config, error) {
 	return config, nil
 }
 
-func (a *Allocator) Assign(identity string, stats Stats, symbols []string) Assignment {
-	role := a.pickRole(identity, stats)
+func (a *Allocator) Assign(_ string, stats Stats, symbols []string) Assignment {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	role := a.pickRole(stats)
 	profile := a.profileFor(role)
-	cash := applyVariance(profile.Cash, profile.VariancePct, identity+":cash")
-	holdings := make(map[string]int64, len(symbols))
-	for _, symbol := range symbols {
-		base := profile.BaseHoldings[symbol]
-		if base == 0 {
-			base = profile.BaseHoldings["*"]
-		}
-		holdings[symbol] = applyVariance(base, profile.VariancePct, identity+":"+symbol)
-	}
+	cash := a.randomizedBudget(profile.Cash, profile.VariancePct)
+	holdings := a.randomizedHoldings(profile, symbols)
 
 	return Assignment{Role: role, Cash: cash, Holdings: holdings}
 }
 
-func (a *Allocator) pickRole(identity string, stats Stats) Role {
+func (a *Allocator) pickRole(stats Stats) Role {
 	total := stats.Buyers + stats.Holders + stats.Whales
-	roll := stableRoll(identity)
-
-	whaleQuotaOpen := (stats.Whales+1)*10 <= total+1
-	if whaleQuotaOpen && roll < 10 {
+	whaleRatio := 0.0
+	if total > 0 {
+		whaleRatio = float64(stats.Whales) / float64(total)
+	}
+	if whaleRatio < 0.10 && a.rng.Float64() < 0.10 {
 		return RoleWhale
 	}
-	if stats.Buyers <= stats.Holders {
+
+	diff := stats.Buyers - stats.Holders
+	switch {
+	case diff >= 2:
+		return RoleHolder
+	case diff <= -2:
 		return RoleBuyer
+	case a.rng.Intn(2) == 0:
+		return RoleBuyer
+	default:
+		return RoleHolder
 	}
-	return RoleHolder
 }
 
 func (a *Allocator) profileFor(role Role) Profile {
@@ -102,25 +120,87 @@ func (a *Allocator) profileFor(role Role) Profile {
 	}
 }
 
-func stableRoll(identity string) int {
-	return int(stableHash(identity) % 100)
-}
-
-func applyVariance(base, variancePct int64, seed string) int64 {
-	if base == 0 || variancePct == 0 {
-		return base
-	}
-	spread := (base * variancePct) / 100
-	offset := int64(stableHash(seed)%uint64((spread*2)+1)) - spread
-	value := base + offset
-	if value < 0 {
+func (a *Allocator) randomizedBudget(base, variancePct int64) int64 {
+	if base <= 0 {
 		return 0
 	}
-	return value
+	spread := float64(base) * (float64(variancePct) / 100.0)
+	value := float64(base) + ((a.rng.Float64()*2 - 1) * spread)
+	if value < 0 {
+		value = 0
+	}
+	return int64(math.Round(value))
 }
 
-func stableHash(value string) uint64 {
-	hash := fnv.New64a()
-	_, _ = hash.Write([]byte(value))
-	return hash.Sum64()
+func (a *Allocator) randomizedHoldings(profile Profile, symbols []string) map[string]int64 {
+	result := make(map[string]int64, len(symbols))
+	if len(symbols) == 0 {
+		return result
+	}
+
+	sorted := append([]string(nil), symbols...)
+	sort.Strings(sorted)
+
+	baseTotal := int64(0)
+	for _, symbol := range sorted {
+		baseTotal += holdingBase(profile, symbol)
+	}
+	if baseTotal <= 0 {
+		return result
+	}
+
+	targetTotal := a.randomizedBudget(baseTotal, maxInt64(4, profile.VariancePct/2))
+	if targetTotal <= 0 {
+		targetTotal = baseTotal
+	}
+
+	weights := make(map[string]float64, len(sorted))
+	weightSum := 0.0
+	for _, symbol := range sorted {
+		base := float64(maxInt64(1, holdingBase(profile, symbol)))
+		jitter := 1.0 + ((a.rng.Float64()*2 - 1) * maxFloat(0.08, float64(profile.VariancePct)/200.0))
+		weight := base * jitter
+		weights[symbol] = weight
+		weightSum += weight
+	}
+	if weightSum == 0 {
+		weightSum = 1
+	}
+
+	remaining := targetTotal
+	for i, symbol := range sorted {
+		if i == len(sorted)-1 {
+			result[symbol] = maxInt64(0, remaining)
+			break
+		}
+		share := int64(math.Round((weights[symbol] / weightSum) * float64(targetTotal)))
+		if share < 0 {
+			share = 0
+		}
+		result[symbol] = share
+		remaining -= share
+	}
+
+	return result
+}
+
+func holdingBase(profile Profile, symbol string) int64 {
+	if value := profile.BaseHoldings[symbol]; value > 0 {
+		return value
+	}
+	return profile.BaseHoldings["*"]
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }

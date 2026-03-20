@@ -9,15 +9,16 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	gossh "github.com/gliderlabs/ssh"
 	"github.com/google/uuid"
 	xssh "golang.org/x/crypto/ssh"
 
+	"github.com/aeza/ssh-arena/internal/config"
 	"github.com/aeza/ssh-arena/internal/exchange"
 	"github.com/aeza/ssh-arena/internal/roles"
+	"github.com/aeza/ssh-arena/internal/state"
 )
 
 type BootstrapRequest struct {
@@ -44,20 +45,26 @@ type GameplayGateway interface {
 	ExecuteAction(ctx context.Context, req ActionRequest) error
 }
 
-type memoryGateway struct {
-	mu        sync.Mutex
+type persistentGateway struct {
 	allocator *roles.Allocator
 	symbols   []string
-	stats     roles.Stats
-	players   map[string]BootstrapResponse
+	store     *state.PlayerStore
 }
 
-func newMemoryGateway() (*memoryGateway, error) {
+func newPersistentGateway() (*persistentGateway, error) {
+	runtimeConfig, err := config.LoadRuntimeConfig("config.yaml")
+	if err != nil {
+		return nil, err
+	}
 	roleConfig, err := roles.LoadConfig("config/roles.json")
 	if err != nil {
 		return nil, err
 	}
 	tickers, err := exchange.LoadTickers("events/stocks.json")
+	if err != nil {
+		return nil, err
+	}
+	store, err := state.LoadPlayerStore(runtimeConfig.PlayerStatePath)
 	if err != nil {
 		return nil, err
 	}
@@ -67,61 +74,68 @@ func newMemoryGateway() (*memoryGateway, error) {
 		symbols = append(symbols, ticker.Symbol)
 	}
 
-	return &memoryGateway{
+	return &persistentGateway{
 		allocator: roles.NewAllocator(roleConfig),
 		symbols:   symbols,
-		players:   make(map[string]BootstrapResponse),
+		store:     store,
 	}, nil
 }
 
-func (g *memoryGateway) EnsurePlayer(_ context.Context, req BootstrapRequest) (BootstrapResponse, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if player, ok := g.players[req.Username]; ok {
-		return player, nil
+func (g *persistentGateway) EnsurePlayer(_ context.Context, req BootstrapRequest) (BootstrapResponse, error) {
+	if player, ok := g.store.Get(req.Username); ok {
+		player.LastLoginAt = time.Now().UTC()
+		if err := g.store.Upsert(player); err != nil {
+			return BootstrapResponse{}, err
+		}
+		return bootstrapResponse(player)
 	}
 
-	assignment := g.allocator.Assign(req.Username, g.stats, g.symbols)
-	player := BootstrapResponse{
-		PlayerID: uuid.NewString(),
-		Role:     string(assignment.Role),
+	assignment := g.allocator.Assign(req.Username, g.store.RoleStats(), g.symbols)
+	player := state.Player{
+		PlayerID:    uuid.NewString(),
+		Username:    req.Username,
+		Role:        string(assignment.Role),
+		Cash:        assignment.Cash,
+		Portfolio:   assignment.Holdings,
+		CreatedAt:   time.Now().UTC(),
+		LastLoginAt: time.Now().UTC(),
 	}
+	if err := g.store.Upsert(player); err != nil {
+		return BootstrapResponse{}, err
+	}
+	return bootstrapResponse(player)
+}
+
+func (g *persistentGateway) ExecuteAction(_ context.Context, req ActionRequest) error {
+	log.Printf("forward action player=%s action=%s payload=%s", req.PlayerID, req.ActionID, req.JSON)
+	return nil
+}
+
+func bootstrapResponse(player state.Player) (BootstrapResponse, error) {
 	payload, err := json.Marshal(map[string]any{
-		"type":      "bootstrap",
-		"player_id": player.PlayerID,
-		"username":  req.Username,
-		"role":      player.Role,
-		"cash":      assignment.Cash,
-		"portfolio": assignment.Holdings,
+		"type":       "bootstrap",
+		"player_id":  player.PlayerID,
+		"username":   player.Username,
+		"role":       player.Role,
+		"cash":       player.Cash,
+		"portfolio":  player.Portfolio,
+		"created_at": player.CreatedAt,
+		"last_login": player.LastLoginAt,
 	})
 	if err != nil {
 		return BootstrapResponse{}, err
 	}
-	player.BootstrapJSON = string(payload)
-	g.players[req.Username] = player
-
-	switch assignment.Role {
-	case roles.RoleBuyer:
-		g.stats.Buyers++
-	case roles.RoleHolder:
-		g.stats.Holders++
-	case roles.RoleWhale:
-		g.stats.Whales++
-	}
-
-	return player, nil
-}
-
-func (g *memoryGateway) ExecuteAction(_ context.Context, req ActionRequest) error {
-	log.Printf("forward action player=%s action=%s payload=%s", req.PlayerID, req.ActionID, req.JSON)
-	return nil
+	return BootstrapResponse{
+		PlayerID:      player.PlayerID,
+		Role:          player.Role,
+		BootstrapJSON: string(payload),
+	}, nil
 }
 
 func main() {
 	addr := envOr("SSH_LISTEN_ADDR", ":2222")
 	hostSigner := envOr("SSH_HOST_KEY_PATH", "./config/dev/ssh_host_ed25519")
-	gateway, err := newMemoryGateway()
+	gateway, err := newPersistentGateway()
 	if err != nil {
 		log.Fatal(err)
 	}

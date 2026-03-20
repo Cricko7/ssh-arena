@@ -8,9 +8,10 @@ import (
 )
 
 type RuntimeConfig struct {
-	ChartTickIntervalSeconds int `yaml:"chart_tick_interval_seconds"`
-	ChartHistoryPoints       int `yaml:"chart_history_points"`
-	ChartOrderbookDepth      int `yaml:"chart_orderbook_depth"`
+	ChartTickIntervalSeconds int    `yaml:"chart_tick_interval_seconds"`
+	ChartHistoryPoints       int    `yaml:"chart_history_points"`
+	ChartOrderbookDepth      int    `yaml:"chart_orderbook_depth"`
+	PlayerStatePath          string `yaml:"player_state_path"`
 }
 
 func DefaultRuntimeConfig() RuntimeConfig {
@@ -18,6 +19,7 @@ func DefaultRuntimeConfig() RuntimeConfig {
 		ChartTickIntervalSeconds: 3,
 		ChartHistoryPoints:       240,
 		ChartOrderbookDepth:      10,
+		PlayerStatePath:          "data/players.json",
 	}
 }
 
@@ -41,6 +43,9 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 	}
 	if cfg.ChartOrderbookDepth <= 0 {
 		cfg.ChartOrderbookDepth = 10
+	}
+	if cfg.PlayerStatePath == "" {
+		cfg.PlayerStatePath = "data/players.json"
 	}
 	return cfg, nil
 }
