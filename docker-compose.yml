@@ -17,6 +17,8 @@ services:
       DB_NAME: ssharena
     ports:
       - "9090:9090"
+    volumes:
+      - game-data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,14 +35,16 @@ services:
       - /bin/sh
       - -c
       - |
-        mkdir -p "$(dirname "$SSH_HOST_KEY_PATH")"
-        if [ ! -f "$SSH_HOST_KEY_PATH" ]; then
-          ssh-keygen -t ed25519 -f "$SSH_HOST_KEY_PATH" -N '' >/dev/null
+        mkdir -p "$(dirname "$$SSH_HOST_KEY_PATH")"
+        if [ ! -f "$$SSH_HOST_KEY_PATH" ]; then
+          ssh-keygen -t ed25519 -f "$$SSH_HOST_KEY_PATH" -N '' >/dev/null
         fi
         exec /app/bin/ssh-server
     environment:
       SSH_LISTEN_ADDR: ":2222"
       SSH_HOST_KEY_PATH: "/var/lib/ssh-arena/ssh/ssh_host_ed25519"
+      REDIS_ADDR: "redis:6379"
+      GRPC_GAME_ADDR: "grpc-game:9090"
     ports:
       - "2222:2222"
     volumes:
@@ -48,6 +52,7 @@ services:
       - game-data:/app/data
     depends_on:
       - grpc-game
+      - redis
     restart: unless-stopped
 
   redis:

@@ -23,7 +23,7 @@ COPY events /app/events
 COPY config.yaml /app/config.yaml
 
 RUN adduser -D -g '' appuser \
-    && mkdir -p /var/lib/ssh-arena/ssh \
+    && mkdir -p /var/lib/ssh-arena/ssh /app/data \
     && chown -R appuser:appuser /app /var/lib/ssh-arena
 
 USER appuser

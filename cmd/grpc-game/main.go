@@ -13,12 +13,17 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	gamev1 "github.com/aeza/ssh-arena/gen/game/v1"
 	"github.com/aeza/ssh-arena/internal/charting"
 	"github.com/aeza/ssh-arena/internal/chat"
 	"github.com/aeza/ssh-arena/internal/config"
 	"github.com/aeza/ssh-arena/internal/exchange"
+	"github.com/aeza/ssh-arena/internal/gameplay"
+	"github.com/aeza/ssh-arena/internal/grpcapi"
+	"github.com/aeza/ssh-arena/internal/grpcjson"
 	"github.com/aeza/ssh-arena/internal/marketevents"
 	"github.com/aeza/ssh-arena/internal/roles"
+	"github.com/aeza/ssh-arena/internal/state"
 )
 
 func main() {
@@ -39,6 +44,10 @@ func main() {
 		log.Fatal(err)
 	}
 	eventDefs, err := marketevents.LoadDefinitions(runtimeConfig.RandomEventsPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	playerStore, err := state.LoadPlayerStore(runtimeConfig.PlayerStatePath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -66,17 +75,26 @@ func main() {
 	}
 	randomEvents.Start(ctx)
 
+	gameEngine := gameplay.NewEngine(playerStore, allocator, exchangeService, chatService, chartEngine)
+	api := grpcapi.New(gameEngine)
+	grpcjson.Register()
+
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	server := grpc.NewServer()
-	healthpb.RegisterHealthServer(server, health.NewServer())
+	server := grpc.NewServer(grpc.ForceServerCodec(grpcjson.Codec{}))
+	healthServer := health.NewServer()
+	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(server, healthServer)
+	gamev1.RegisterAccountServiceServer(server, api)
+	gamev1.RegisterGameServiceServer(server, api)
+	gamev1.RegisterChatServiceServer(server, api)
 	reflection.Register(server)
 
 	log.Printf("grpc game service listening on %s", addr)
-	log.Printf("exchange core ready: tickers=%d roles=%T chart_interval=%ds chart_history=%d chart_depth=%d random_event_interval=%ds random_events=%d cache_enabled=%t service=%T", len(tickers), allocator, runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, runtimeConfig.RandomEventIntervalSecs, len(eventDefs), cache != nil, exchangeService)
+	log.Printf("exchange core ready: tickers=%d chart_interval=%ds chart_history=%d chart_depth=%d random_event_interval=%ds random_events=%d cache_enabled=%t", len(tickers), runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, runtimeConfig.RandomEventIntervalSecs, len(eventDefs), cache != nil)
 	if err := server.Serve(lis); err != nil {
 		log.Fatal(err)
 	}

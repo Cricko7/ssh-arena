@@ -58,6 +58,8 @@ type PlaceOrderOutput struct {
 	OrderBook  orderbook.Snapshot `json:"orderbook"`
 	Price      PricePoint         `json:"price"`
 	Trades     []orderbook.Trade  `json:"trades"`
+	Resting    *orderbook.Order   `json:"resting,omitempty"`
+	Removed    []string           `json:"removed_order_ids,omitempty"`
 	JSON       string             `json:"json"`
 	OccurredAt time.Time          `json:"occurred_at"`
 }

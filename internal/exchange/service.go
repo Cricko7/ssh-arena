@@ -20,6 +20,8 @@ type Service struct {
 	chat         *chat.Service
 	cache        Cache
 	recentTrades map[string][]orderbook.Trade
+	nextSubID    int
+	subscribers  map[int]chan string
 }
 
 func NewService(tickers []Ticker, chatService *chat.Service, cache Cache) *Service {
@@ -37,6 +39,7 @@ func NewService(tickers []Ticker, chatService *chat.Service, cache Cache) *Servi
 		chat:         chatService,
 		cache:        cache,
 		recentTrades: make(map[string][]orderbook.Trade, len(tickers)),
+		subscribers:  make(map[int]chan string),
 	}
 }
 
@@ -48,6 +51,24 @@ func (s *Service) ListTickers() []string {
 		out = append(out, symbol)
 	}
 	return out
+}
+
+func (s *Service) Subscribe(ctx context.Context) <-chan string {
+	s.mu.Lock()
+	id := s.nextSubID
+	s.nextSubID++
+	ch := make(chan string, 64)
+	s.subscribers[id] = ch
+	s.mu.Unlock()
+
+	go func() {
+		<-ctx.Done()
+		s.mu.Lock()
+		delete(s.subscribers, id)
+		close(ch)
+		s.mu.Unlock()
+	}()
+	return ch
 }
 
 func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceOrderOutput, error) {
@@ -100,6 +121,7 @@ func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceO
 		return PlaceOrderOutput{}, err
 	}
 
+	s.publishLocked(jsonPayload)
 	if s.cache != nil {
 		if err := s.cache.PutSnapshot(ctx, input.Symbol, jsonPayload); err != nil {
 			return PlaceOrderOutput{}, err
@@ -114,9 +136,45 @@ func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceO
 		OrderBook:  result.Snapshot,
 		Price:      price,
 		Trades:     s.recentTrades[input.Symbol],
+		Resting:    result.Resting,
+		Removed:    result.Removed,
 		JSON:       jsonPayload,
 		OccurredAt: time.Now().UTC(),
 	}, nil
+}
+
+func (s *Service) CancelOrder(ctx context.Context, symbol string, orderID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	book, ok := s.books[symbol]
+	if !ok {
+		return "", fmt.Errorf("unsupported symbol %q", symbol)
+	}
+	cancelled, snapshot, err := book.Cancel(orderID)
+	if err != nil {
+		return "", err
+	}
+	price, err := s.priceEngine.Current(symbol)
+	if err != nil {
+		return "", err
+	}
+	payload := map[string]any{
+		"order":         cancelled,
+		"orderbook":     snapshot,
+		"price":         price,
+		"recent_trades": s.recentTrades[symbol],
+	}
+	jsonPayload, err := MarshalEnvelope("market.cancel", payload)
+	if err != nil {
+		return "", err
+	}
+	s.publishLocked(jsonPayload)
+	if s.cache != nil {
+		_ = s.cache.PutSnapshot(ctx, symbol, jsonPayload)
+		_ = s.cache.Publish(ctx, "arena.market."+symbol, jsonPayload)
+	}
+	return jsonPayload, nil
 }
 
 func (s *Service) TriggerMarketEvent(ctx context.Context, input EventShockInput) (EventShockOutput, error) {
@@ -180,6 +238,7 @@ func (s *Service) TriggerMarketEvent(ctx context.Context, input EventShockInput)
 		return EventShockOutput{}, err
 	}
 
+	s.publishLocked(jsonPayload)
 	if s.cache != nil {
 		for symbol, payload := range cachePayloads {
 			_ = s.cache.PutSnapshot(ctx, symbol, payload)
@@ -247,4 +306,13 @@ func (s *Service) BroadcastChat(ctx context.Context, message chat.Message) (stri
 		return "", fmt.Errorf("chat service is not configured")
 	}
 	return s.chat.Broadcast(ctx, message)
+}
+
+func (s *Service) publishLocked(payload string) {
+	for _, ch := range s.subscribers {
+		select {
+		case ch <- payload:
+		default:
+		}
+	}
 }

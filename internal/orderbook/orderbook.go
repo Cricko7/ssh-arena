@@ -200,6 +200,48 @@ func (b *Book) Place(order Order) (PlacementResult, error) {
 	return result, nil
 }
 
+func (b *Book) Cancel(orderID string) (Order, Snapshot, error) {
+	for _, price := range append([]int64(nil), b.bidPrices...) {
+		orders := b.bids[price]
+		for i, order := range orders {
+			if order.ID != orderID {
+				continue
+			}
+			cancelled := *order
+			cancelled.Status = OrderStatusCancelled
+			orders = append(orders[:i], orders[i+1:]...)
+			if len(orders) == 0 {
+				delete(b.bids, price)
+				b.bidPrices = removePrice(b.bidPrices, price)
+			} else {
+				b.bids[price] = orders
+			}
+			b.sequence++
+			return cancelled, b.Snapshot(10), nil
+		}
+	}
+	for _, price := range append([]int64(nil), b.askPrices...) {
+		orders := b.asks[price]
+		for i, order := range orders {
+			if order.ID != orderID {
+				continue
+			}
+			cancelled := *order
+			cancelled.Status = OrderStatusCancelled
+			orders = append(orders[:i], orders[i+1:]...)
+			if len(orders) == 0 {
+				delete(b.asks, price)
+				b.askPrices = removePrice(b.askPrices, price)
+			} else {
+				b.asks[price] = orders
+			}
+			b.sequence++
+			return cancelled, b.Snapshot(10), nil
+		}
+	}
+	return Order{}, Snapshot{}, fmt.Errorf("order %q not found", orderID)
+}
+
 func (b *Book) Snapshot(depth int) Snapshot {
 	if depth <= 0 {
 		depth = 10
