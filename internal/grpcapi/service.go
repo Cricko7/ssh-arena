@@ -94,6 +94,7 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 	}()
 
 	var playerID string
+	var privateFeed <-chan string
 	symbols := map[string]struct{}{}
 	includePortfolio := false
 	includeChat := false
@@ -115,6 +116,9 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 				continue
 			}
 			playerID = req.PlayerID
+			if playerID != "" && privateFeed == nil {
+				privateFeed = s.engine.SubscribePrivate(ctx, playerID)
+			}
 			includePortfolio = req.IncludePortfolio
 			includeChat = req.IncludeChat
 			symbols = make(map[string]struct{}, len(req.Symbols))
@@ -136,6 +140,13 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 				continue
 			}
 			if err := stream.Send(s.envelope("chat", payload)); err != nil {
+				return err
+			}
+		case payload, ok := <-privateFeed:
+			if !ok || payload == "" {
+				continue
+			}
+			if err := stream.Send(s.envelope("private", payload)); err != nil {
 				return err
 			}
 		case <-ticker.C:

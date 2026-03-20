@@ -223,6 +223,7 @@ func (s *Service) TriggerMarketEvent(ctx context.Context, input EventShockInput)
 	}
 
 	payload := map[string]any{
+		"kind":             input.Kind,
 		"name":             input.EventName,
 		"message":          input.Message,
 		"global":           input.Global,

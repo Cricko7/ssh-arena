@@ -21,6 +21,7 @@ import (
 	"github.com/aeza/ssh-arena/internal/gameplay"
 	"github.com/aeza/ssh-arena/internal/grpcapi"
 	"github.com/aeza/ssh-arena/internal/grpcjson"
+	"github.com/aeza/ssh-arena/internal/intel"
 	"github.com/aeza/ssh-arena/internal/marketevents"
 	"github.com/aeza/ssh-arena/internal/roles"
 	"github.com/aeza/ssh-arena/internal/state"
@@ -44,6 +45,10 @@ func main() {
 		log.Fatal(err)
 	}
 	eventDefs, err := marketevents.LoadDefinitions(runtimeConfig.RandomEventsPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	intelDefs, err := intel.LoadDefinitions(runtimeConfig.IntelEventsPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -76,6 +81,15 @@ func main() {
 	randomEvents.Start(ctx)
 
 	gameEngine := gameplay.NewEngine(playerStore, allocator, exchangeService, chatService, chartEngine)
+	intelEngine, err := intel.NewEngine(intel.Config{
+		Interval: time.Duration(runtimeConfig.IntelEventIntervalSecs) * time.Second,
+	}, intelDefs, exchangeService, gameEngine)
+	if err != nil {
+		log.Fatal(err)
+	}
+	gameEngine.SetIntelEngine(intelEngine)
+	intelEngine.Start(ctx)
+
 	api := grpcapi.New(gameEngine)
 	grpcjson.Register()
 
@@ -94,7 +108,7 @@ func main() {
 	reflection.Register(server)
 
 	log.Printf("grpc game service listening on %s", addr)
-	log.Printf("exchange core ready: tickers=%d chart_interval=%ds chart_history=%d chart_depth=%d random_event_interval=%ds random_events=%d cache_enabled=%t", len(tickers), runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, runtimeConfig.RandomEventIntervalSecs, len(eventDefs), cache != nil)
+	log.Printf("exchange core ready: tickers=%d chart_interval=%ds chart_history=%d chart_depth=%d random_event_interval=%ds random_events=%d intel_interval=%ds intel_defs=%d cache_enabled=%t", len(tickers), runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, runtimeConfig.RandomEventIntervalSecs, len(eventDefs), runtimeConfig.IntelEventIntervalSecs, len(intelDefs), cache != nil)
 	if err := server.Serve(lis); err != nil {
 		log.Fatal(err)
 	}

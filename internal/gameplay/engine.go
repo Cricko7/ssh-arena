@@ -14,20 +14,24 @@ import (
 	"github.com/aeza/ssh-arena/internal/charting"
 	"github.com/aeza/ssh-arena/internal/chat"
 	"github.com/aeza/ssh-arena/internal/exchange"
+	"github.com/aeza/ssh-arena/internal/intel"
 	"github.com/aeza/ssh-arena/internal/orderbook"
 	"github.com/aeza/ssh-arena/internal/roles"
 	"github.com/aeza/ssh-arena/internal/state"
 )
 
 type Engine struct {
-	mu         sync.Mutex
-	players    *state.PlayerStore
-	allocator  *roles.Allocator
-	market     *exchange.Service
-	chat       *chat.Service
-	charts     *charting.Engine
-	symbols    []string
-	openOrders map[string]*openOrder
+	mu            sync.Mutex
+	players       *state.PlayerStore
+	allocator     *roles.Allocator
+	market        *exchange.Service
+	chat          *chat.Service
+	charts        *charting.Engine
+	intel         *intel.Engine
+	symbols       []string
+	openOrders    map[string]*openOrder
+	privateSubs   map[string]map[int]chan string
+	nextPrivateID int
 }
 
 type openOrder struct {
@@ -91,13 +95,14 @@ func NewEngine(players *state.PlayerStore, allocator *roles.Allocator, market *e
 	symbols := market.ListTickers()
 	sort.Strings(symbols)
 	return &Engine{
-		players:    players,
-		allocator:  allocator,
-		market:     market,
-		chat:       chatService,
-		charts:     charts,
-		symbols:    symbols,
-		openOrders: make(map[string]*openOrder),
+		players:     players,
+		allocator:   allocator,
+		market:      market,
+		chat:        chatService,
+		charts:      charts,
+		symbols:     symbols,
+		openOrders:  make(map[string]*openOrder),
+		privateSubs: make(map[string]map[int]chan string),
 	}
 }
 
@@ -158,6 +163,10 @@ func (e *Engine) ExecuteAction(ctx context.Context, req ExecuteActionRequest) (s
 		return e.handleSendChat(ctx, req)
 	case "market.snapshot":
 		return e.handleMarketSnapshot(req)
+	case "intel.catalog", "intel.list":
+		return e.handleIntelCatalog()
+	case "intel.buy":
+		return e.handleIntelBuy(ctx, req)
 	default:
 		return "", fmt.Errorf("unsupported action %q", req.ActionID)
 	}

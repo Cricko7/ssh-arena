@@ -14,6 +14,8 @@ type RuntimeConfig struct {
 	PlayerStatePath          string `yaml:"player_state_path"`
 	RandomEventIntervalSecs  int    `yaml:"random_event_interval_seconds"`
 	RandomEventsPath         string `yaml:"random_events_path"`
+	IntelEventIntervalSecs   int    `yaml:"intel_event_interval_seconds"`
+	IntelEventsPath          string `yaml:"intel_events_path"`
 }
 
 func DefaultRuntimeConfig() RuntimeConfig {
@@ -24,6 +26,8 @@ func DefaultRuntimeConfig() RuntimeConfig {
 		PlayerStatePath:          "data/players.json",
 		RandomEventIntervalSecs:  15,
 		RandomEventsPath:         "events/random_events.json",
+		IntelEventIntervalSecs:   12,
+		IntelEventsPath:          "events/intel_feeds.json",
 	}
 }
 
@@ -56,6 +60,12 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 	}
 	if cfg.RandomEventsPath == "" {
 		cfg.RandomEventsPath = "events/random_events.json"
+	}
+	if cfg.IntelEventIntervalSecs <= 0 {
+		cfg.IntelEventIntervalSecs = 12
+	}
+	if cfg.IntelEventsPath == "" {
+		cfg.IntelEventsPath = "events/intel_feeds.json"
 	}
 	return cfg, nil
 }

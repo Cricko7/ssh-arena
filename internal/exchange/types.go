@@ -73,6 +73,7 @@ type ChartSnapshot struct {
 }
 
 type EventShockInput struct {
+	Kind          string
 	EventName     string
 	Message       string
 	Global        bool

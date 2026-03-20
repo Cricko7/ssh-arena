@@ -157,6 +157,7 @@ func (e *Engine) tick(ctx context.Context) {
 			message = strings.ReplaceAll(message, "<TICKER>", symbol)
 		}
 		_, _ = e.market.TriggerMarketEvent(ctx, exchange.EventShockInput{
+			Kind:          "random_event",
 			EventName:     def.Name,
 			Message:       message,
 			Global:        def.Global,

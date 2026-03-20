@@ -1,0 +1,64 @@
+﻿{
+  "feeds": [
+    {
+      "id": "insider.musk.buy",
+      "kind": "insider",
+      "name": "Инсайд: крупная покупка <ticker>",
+      "description": "Платный инсайд на конкретное событие. Если оно выпадет, ты узнаешь о нём раньше рынка.",
+      "message": "Илон Маск купил <ticker>. Толпа резко уходит в покупки.",
+      "private_message": "Через несколько секунд рынок увидит новость по <ticker>. Готовься к импульсу вверх.",
+      "chance": 6,
+      "price": 18000,
+      "market_multiplier": "10-20",
+      "duration_seconds": 75,
+      "lead_time_seconds": 18,
+      "global": false
+    },
+    {
+      "id": "rumor.investigation",
+      "kind": "rumor",
+      "name": "Слухи о расследовании по <ticker>",
+      "description": "Публичный слух. Может резко ухудшить настроение по тикеру.",
+      "message": "По <ticker> пошли слухи о возможном расследовании. Лента быстро краснеет.",
+      "chance": 8,
+      "market_multiplier": "-14--6",
+      "duration_seconds": 70,
+      "global": false
+    },
+    {
+      "id": "fake.breakthrough",
+      "kind": "fake_news",
+      "name": "Фейковая новость о прорыве в <ticker>",
+      "description": "Псевдоновость, которая может спровоцировать памп до выяснения деталей.",
+      "message": "В сети разгоняют новость о прорыве в <ticker>. Толпа покупает на эмоциях.",
+      "chance": 7,
+      "market_multiplier": "6-16",
+      "duration_seconds": 55,
+      "global": false
+    },
+    {
+      "id": "analytics.crypto.momentum",
+      "kind": "paid_analytics",
+      "name": "Momentum-аналитика по <ticker>",
+      "description": "Платный аналитический отчёт с bias, текущей ценой и стаканом.",
+      "message": "Аналитики видят по <ticker> повышенный импульс и советуют искать точку входа по направлению доминирующего движения.",
+      "price": 6500,
+      "market_multiplier": "5-12",
+      "duration_seconds": 0,
+      "global": false
+    },
+    {
+      "id": "analytics.market.riskoff",
+      "kind": "paid_analytics",
+      "name": "Макро-аналитика risk-off",
+      "description": "Общий рыночный отчёт с оценкой риска и импульса.",
+      "message": "Модель риск-менеджмента сигнализирует о сдвиге рынка в защитный режим. Следи за ликвидностью и скоростью снятия заявок.",
+      "price": 9000,
+      "market_multiplier": "-8--2",
+      "duration_seconds": 0,
+      "global": true,
+      "ticker": "TECH"
+    }
+  ]
+}
+
