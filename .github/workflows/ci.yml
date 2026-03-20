@@ -1,43 +1,23 @@
-name: Docker Build and Push
+name: Build & Push
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-env:
-  REGISTRY: docker.io
-  IMAGE_NAME: Cricko7/ssh-arena
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Опция для подавления предупреждения про Node 20 (можно убрать позже)
-    env: 
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # === ВОТ ЗДЕСЬ ИСПРАВЛЕНИЕ ===
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      # =============================
 
-      - name: Build and push
+      - name: Build & Push
         uses: docker/build-push-action@v5
         with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/ssh-arena:latest
