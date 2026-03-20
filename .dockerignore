@@ -1,0 +1,9 @@
+.git
+.gitignore
+*.md
+Makefile
+vendor/
+bin/
+.env
+.idea/
+.vscode/
