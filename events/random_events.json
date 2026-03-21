@@ -1,50 +1,50 @@
 {
   "events": [
     {
-      "name": "Илон Маск купил <ticker>",
-      "message": "Илон Маск купил <ticker>. Рынок разгоняет цену вверх.",
-      "chance": 8,
-      "market_multiplier": "10-20",
+      "name": "Celebrity Buy In <ticker>",
+      "message": "A celebrity buy-in rumor is pushing <ticker> higher.",
+      "chance": 3,
+      "market_multiplier": "8-16",
       "duration_seconds": 75,
       "global": false
     },
     {
-      "name": "Фондовый оптимизм",
-      "message": "На рынке волна оптимизма. Покупатели агрессивнее обычного.",
-      "chance": 6,
-      "market_multiplier": "4-9",
+      "name": "Risk On Session",
+      "message": "A broad risk-on wave is lifting bids across the market.",
+      "chance": 2,
+      "market_multiplier": "3-7",
       "duration_seconds": 90,
       "global": true
     },
     {
-      "name": "Слухи о расследовании",
-      "message": "По <ticker> пошли негативные слухи. Участники рынка разгружают позиции.",
-      "chance": 7,
-      "market_multiplier": "-14--6",
+      "name": "Regulatory Rumor <ticker>",
+      "message": "A regulatory rumor is weighing on <ticker> and sellers are pressing.",
+      "chance": 3,
+      "market_multiplier": "-12--5",
       "duration_seconds": 70,
       "global": false
     },
     {
-      "name": "Паника на рынке",
-      "message": "На всём рынке включился risk-off режим. Ликвидность уходит из стаканов.",
-      "chance": 4,
-      "market_multiplier": "-12--4",
+      "name": "Risk Off Wave",
+      "message": "A market-wide risk-off move is draining bids and widening spreads.",
+      "chance": 2,
+      "market_multiplier": "-10--4",
       "duration_seconds": 80,
       "global": true
     },
     {
-      "name": "Шорт-сквиз в <ticker>",
-      "message": "По <ticker> начался шорт-сквиз. Цена ускоряется вверх.",
-      "chance": 5,
-      "market_multiplier": "8-18",
+      "name": "Short Squeeze <ticker>",
+      "message": "Shorts are trapped in <ticker> and momentum is accelerating upward.",
+      "chance": 2,
+      "market_multiplier": "7-14",
       "duration_seconds": 60,
       "global": false
     },
     {
-      "name": "Неожиданный отчёт",
-      "message": "Новый отчёт по <ticker> оказался спорным. Волатильность резко выросла.",
-      "chance": 9,
-      "market_multiplier": "-10-10",
+      "name": "Mixed Earnings <ticker>",
+      "message": "A mixed earnings read on <ticker> is driving sharp two-way volatility.",
+      "chance": 3,
+      "market_multiplier": "-8-8",
       "duration_seconds": 65,
       "global": false
     }
