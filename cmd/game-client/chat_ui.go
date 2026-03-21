@@ -49,6 +49,18 @@ type streamPortfolioMsg struct {
 	snapshot portfolioSnapshot
 }
 
+type insiderPreviewPayload struct {
+	Type         string    `json:"type"`
+	IntelID      string    `json:"intel_id"`
+	Name         string    `json:"name"`
+	Message      string    `json:"message"`
+	Symbol       string    `json:"symbol"`
+	Global       bool      `json:"global"`
+	ScheduledFor time.Time `json:"scheduled_for"`
+	PreviewedAt  time.Time `json:"previewed_at"`
+	LeadTimeSecs int       `json:"lead_time_seconds"`
+}
+
 func startMarketStream(ctx context.Context, cfg config, ch chan<- any) {
 	grpcjson.Register()
 	codec := encoding.GetCodec("json")
@@ -115,14 +127,44 @@ func startMarketStream(ctx context.Context, cfg config, ch chan<- any) {
 
 func decodeChatEntry(raw string, topic string) (chatEntry, bool) {
 	var entry chatEntry
-	if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+	if err := json.Unmarshal([]byte(raw), &entry); err == nil {
+		if strings.TrimSpace(entry.Body) != "" {
+			entry.Topic = topic
+			return entry, true
+		}
+	}
+	if topic != "private" {
 		return chatEntry{}, false
 	}
-	if strings.TrimSpace(entry.Body) == "" {
+	var preview insiderPreviewPayload
+	if err := json.Unmarshal([]byte(raw), &preview); err != nil {
 		return chatEntry{}, false
 	}
-	entry.Topic = topic
-	return entry, true
+	if preview.Type != "intel.insider.preview" || strings.TrimSpace(preview.Message) == "" {
+		return chatEntry{}, false
+	}
+	body := preview.Message
+	if !preview.ScheduledFor.IsZero() {
+		body = fmt.Sprintf("%s | event at %s", body, preview.ScheduledFor.Local().Format("15:04:05"))
+	}
+	return chatEntry{
+		Type:        preview.Type,
+		Channel:     "direct",
+		PlayerID:    "system",
+		Username:    "insider-feed",
+		Role:        "Intel",
+		Body:        body,
+		SentAt:      choosePreviewTime(preview),
+		Topic:       topic,
+		RecipientID: "",
+	}, true
+}
+
+func choosePreviewTime(preview insiderPreviewPayload) time.Time {
+	if !preview.PreviewedAt.IsZero() {
+		return preview.PreviewedAt
+	}
+	return time.Now().UTC()
 }
 
 func appendChatEntry(state *uiState, entry chatEntry) {
@@ -278,6 +320,8 @@ func renderChatPanel(screen tcell.Screen, colors palette, rect tickerRect, state
 
 func chatDisplayParts(entry chatEntry, selfID string, selfUsername string, colors palette) (string, string, string, tcell.Style) {
 	switch {
+	case entry.Type == "intel.insider.preview":
+		return "[intel]", "insider-feed", "", colors.accentOn(colors.panelBG)
 	case entry.Type == "chat.direct" && entry.PlayerID == selfID:
 		name := entry.RecipientUsername
 		if name == "" {
@@ -308,6 +352,10 @@ func chatDisplayParts(entry chatEntry, selfID string, selfUsername string, color
 func copyPlayerIDIntoChat(state *uiState, rect chatNameRect) {
 	state.chatInput = "/dm " + rect.PlayerID + " "
 	state.chatFocus = true
+	if rect.PlayerID == "" {
+		state.status = fmt.Sprintf("prepared chat focus for %s", rect.Username)
+		return
+	}
 	if err := copyToClipboardBestEffort(rect.PlayerID); err != nil {
 		state.status = fmt.Sprintf("prepared DM to %s (%s)", rect.Username, rect.PlayerID)
 		return
@@ -317,6 +365,6 @@ func copyPlayerIDIntoChat(state *uiState, rect chatNameRect) {
 
 func copyToClipboardBestEffort(value string) error {
 	encoded := base64.StdEncoding.EncodeToString([]byte(value))
-	_, err := fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\x07", encoded)
+	_, err := fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\a", encoded)
 	return err
 }

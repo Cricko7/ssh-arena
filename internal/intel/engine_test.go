@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aeza/ssh-arena/internal/exchange"
+	"github.com/aeza/ssh-arena/internal/marketevents"
 	"github.com/aeza/ssh-arena/internal/orderbook"
 )
 
@@ -55,40 +56,58 @@ func TestParseRangeSupportsNegativeSpan(t *testing.T) {
 	}
 }
 
-func TestBuyInsiderConsumesOnTrigger(t *testing.T) {
+func TestBuyInsiderGetsNextRandomEventPreview(t *testing.T) {
 	market := &mockMarket{tickers: []string{"TECH"}}
 	notifier := &mockNotifier{}
 	engine, err := NewEngine(Config{Interval: time.Second}, []Definition{{
-		ID:               "insider.tech",
-		Kind:             KindInsider,
-		Name:             "Insider <ticker>",
-		Message:          "Public <ticker>",
-		PrivateMessage:   "Private <ticker>",
-		Chance:           100,
-		Price:            1000,
-		MarketMultiplier: "10-10",
-		DurationSeconds:  30,
-		LeadTimeSeconds:  0,
-		Global:           false,
+		ID:              "insider.next_event",
+		Kind:            KindInsider,
+		Name:            "Next event preview",
+		Description:     "See the next random event 30 seconds early.",
+		PrivateMessage:  "Preview: <ticker> will move soon.",
+		Price:           1000,
+		LeadTimeSeconds: 1,
 	}}, market, notifier)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	_, err = engine.Buy(context.Background(), "player-a", "insider.tech")
+
+	result, err := engine.Buy(context.Background(), "player-a", "insider.next_event")
 	if err != nil {
 		t.Fatalf("Buy: %v", err)
 	}
-	engine.tick(context.Background())
-	if len(notifier.payloads["player-a"]) != 1 {
-		t.Fatalf("expected insider preview to be delivered once, got %d", len(notifier.payloads["player-a"]))
+	if !strings.Contains(result.PayloadJSON, "intel.purchase.armed") {
+		t.Fatalf("expected armed payload, got %s", result.PayloadJSON)
 	}
-	if len(market.events) != 1 {
-		t.Fatalf("expected public event to be triggered, got %d", len(market.events))
+
+	event := marketevents.PlannedEvent{
+		ID:              "evt-1",
+		Kind:            "random_event",
+		EventName:       "Big TECH move",
+		Message:         "TECH is about to squeeze higher.",
+		Symbol:          "TECH",
+		MultiplierPct:   15,
+		DurationSeconds: 60,
+		ScheduledAt:     time.Now().UTC().Add(1100 * time.Millisecond),
 	}
-	engine.tick(context.Background())
-	if len(notifier.payloads["player-a"]) != 1 {
-		t.Fatalf("expected entitlement to be consumed after one trigger")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	engine.ScheduleNextRandomEvent(ctx, event)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(notifier.payloads["player-a"]) > 0 {
+			if !strings.Contains(notifier.payloads["player-a"][0], "intel.insider.preview") {
+				t.Fatalf("unexpected preview payload: %s", notifier.payloads["player-a"][0])
+			}
+			if !strings.Contains(notifier.payloads["player-a"][0], "TECH") {
+				t.Fatalf("expected ticker in preview payload: %s", notifier.payloads["player-a"][0])
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	t.Fatal("expected insider preview notification")
 }
 
 func TestPaidAnalyticsReturnsReport(t *testing.T) {

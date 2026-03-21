@@ -12,6 +12,7 @@ import (
 
 	"github.com/aeza/ssh-arena/internal/exchange"
 	"github.com/aeza/ssh-arena/internal/jsonfile"
+	"github.com/aeza/ssh-arena/internal/marketevents"
 )
 
 type Kind string
@@ -80,15 +81,23 @@ type preparedDefinition struct {
 	Multiplier Range
 }
 
+type scheduledRandomEvent struct {
+	Event       marketevents.PlannedEvent
+	Buyers      map[string]struct{}
+	PreviewSent bool
+}
+
 type Engine struct {
-	cfg          Config
-	market       Market
-	notifier     Notifier
-	mu           sync.Mutex
-	rng          *rand.Rand
-	defs         map[string]preparedDefinition
-	orderedDefs  []preparedDefinition
-	entitlements map[string]map[string]int
+	cfg      Config
+	market   Market
+	notifier Notifier
+
+	mu                   sync.Mutex
+	rng                  *rand.Rand
+	defs                 map[string]preparedDefinition
+	orderedDefs          []preparedDefinition
+	pendingInsiderBuyers map[string]struct{}
+	nextRandomEvent      *scheduledRandomEvent
 }
 
 func LoadDefinitions(path string) ([]Definition, error) {
@@ -109,32 +118,33 @@ func NewEngine(cfg Config, defs []Definition, market Market, notifier Notifier) 
 		if def.ID == "" || def.Name == "" {
 			return nil, fmt.Errorf("intel id and name are required")
 		}
+		if def.LeadTimeSeconds <= 0 && def.Kind == KindInsider {
+			def.LeadTimeSeconds = 30
+		}
 		if def.DurationSeconds <= 0 {
 			def.DurationSeconds = 45
 		}
-		if def.Kind == KindRumor || def.Kind == KindFakeNews || def.Kind == KindInsider {
+
+		prepared := preparedDefinition{Definition: def}
+		if def.Kind == KindRumor || def.Kind == KindFakeNews || def.Kind == KindPaidAnalysis {
 			multiplier, err := parseRange(def.MarketMultiplier)
 			if err != nil {
 				return nil, fmt.Errorf("intel %q: %w", def.ID, err)
 			}
-			prepared := preparedDefinition{Definition: def, Multiplier: multiplier}
-			preparedMap[def.ID] = prepared
-			preparedList = append(preparedList, prepared)
-			continue
+			prepared.Multiplier = multiplier
 		}
-		prepared := preparedDefinition{Definition: def}
 		preparedMap[def.ID] = prepared
 		preparedList = append(preparedList, prepared)
 	}
 	sort.Slice(preparedList, func(i, j int) bool { return preparedList[i].ID < preparedList[j].ID })
 	return &Engine{
-		cfg:          cfg,
-		market:       market,
-		notifier:     notifier,
-		rng:          rand.New(rand.NewSource(time.Now().UnixNano())),
-		defs:         preparedMap,
-		orderedDefs:  preparedList,
-		entitlements: make(map[string]map[string]int),
+		cfg:                  cfg,
+		market:               market,
+		notifier:             notifier,
+		rng:                  rand.New(rand.NewSource(time.Now().UnixNano())),
+		defs:                 preparedMap,
+		orderedDefs:          preparedList,
+		pendingInsiderBuyers: make(map[string]struct{}),
 	}, nil
 }
 
@@ -172,23 +182,15 @@ func (e *Engine) Buy(ctx context.Context, playerID string, intelID string) (BuyR
 		return BuyResult{}, fmt.Errorf("intel %q not found", intelID)
 	}
 	if def.Kind == KindInsider {
-		if _, ok := e.entitlements[intelID]; !ok {
-			e.entitlements[intelID] = make(map[string]int)
-		}
-		e.entitlements[intelID][playerID]++
+		result, err := e.buyInsiderLocked(playerID, def)
 		e.mu.Unlock()
-		payload := map[string]any{
-			"type":         "intel.purchase.armed",
-			"intel_id":     def.ID,
-			"kind":         def.Kind,
-			"name":         def.Name,
-			"price_paid":   def.Price,
-			"lead_time":    def.LeadTimeSeconds,
-			"description":  def.Description,
-			"message":      "Insider access armed. If this event triggers, you will get the preview before the rest of the market.",
-			"purchased_at": time.Now().UTC(),
+		if err != nil {
+			return BuyResult{}, err
 		}
-		return BuyResult{Cost: def.Price, PayloadJSON: marshal(payload)}, nil
+		if result.dispatchPayload != "" && e.notifier != nil {
+			e.notifier.NotifyPlayer(playerID, result.dispatchPayload)
+		}
+		return BuyResult{Cost: def.Price, PayloadJSON: result.responsePayload}, nil
 	}
 	e.mu.Unlock()
 
@@ -200,6 +202,66 @@ func (e *Engine) Buy(ctx context.Context, playerID string, intelID string) (BuyR
 		return BuyResult{}, err
 	}
 	return BuyResult{Cost: def.Price, PayloadJSON: payloadJSON}, nil
+}
+
+type insiderBuyOutcome struct {
+	responsePayload string
+	dispatchPayload string
+}
+
+func (e *Engine) buyInsiderLocked(playerID string, def preparedDefinition) (insiderBuyOutcome, error) {
+	now := time.Now().UTC()
+	if e.nextRandomEvent != nil && !now.Before(e.nextRandomEvent.Event.ScheduledAt) {
+		e.nextRandomEvent = nil
+	}
+	if e.nextRandomEvent == nil {
+		if _, exists := e.pendingInsiderBuyers[playerID]; exists {
+			return insiderBuyOutcome{}, fmt.Errorf("insider preview is already armed for your next market event")
+		}
+		e.pendingInsiderBuyers[playerID] = struct{}{}
+		payload := marshal(map[string]any{
+			"type":              "intel.purchase.armed",
+			"intel_id":          def.ID,
+			"kind":              def.Kind,
+			"name":              def.Name,
+			"price_paid":        def.Price,
+			"lead_time_seconds": def.LeadTimeSeconds,
+			"scope":             "next_random_event",
+			"description":       def.Description,
+			"message":           "Insider access armed. You will receive the next scheduled random market event before everyone else.",
+			"purchased_at":      now,
+		})
+		return insiderBuyOutcome{responsePayload: payload}, nil
+	}
+
+	current := e.nextRandomEvent
+	if _, exists := current.Buyers[playerID]; exists {
+		return insiderBuyOutcome{}, fmt.Errorf("insider preview is already armed for the next market event")
+	}
+	previewAt := current.Event.ScheduledAt.Add(-time.Duration(def.LeadTimeSeconds) * time.Second)
+	if previewAt.After(now) {
+		current.Buyers[playerID] = struct{}{}
+		payload := marshal(map[string]any{
+			"type":              "intel.purchase.armed",
+			"intel_id":          def.ID,
+			"kind":              def.Kind,
+			"name":              def.Name,
+			"price_paid":        def.Price,
+			"lead_time_seconds": def.LeadTimeSeconds,
+			"scope":             "next_random_event",
+			"event_name":        current.Event.EventName,
+			"scheduled_for":     current.Event.ScheduledAt,
+			"preview_at":        previewAt,
+			"description":       def.Description,
+			"message":           "Insider access armed for the next random market event.",
+			"purchased_at":      now,
+		})
+		return insiderBuyOutcome{responsePayload: payload}, nil
+	}
+
+	current.Buyers[playerID] = struct{}{}
+	preview := e.buildInsiderPreview(def, current.Event, now)
+	return insiderBuyOutcome{responsePayload: preview, dispatchPayload: preview}, nil
 }
 
 func (e *Engine) Start(ctx context.Context) {
@@ -219,9 +281,103 @@ func (e *Engine) run(ctx context.Context) {
 	}
 }
 
+func (e *Engine) ScheduleNextRandomEvent(ctx context.Context, event marketevents.PlannedEvent) {
+	if e.insiderDefinition() == nil {
+		return
+	}
+	now := time.Now().UTC()
+	e.mu.Lock()
+	buyers := copyBuyerSet(e.pendingInsiderBuyers)
+	e.pendingInsiderBuyers = make(map[string]struct{})
+	e.nextRandomEvent = &scheduledRandomEvent{
+		Event:       event,
+		Buyers:      buyers,
+		PreviewSent: false,
+	}
+	e.mu.Unlock()
+	e.maybeDispatchScheduledPreview(ctx, event.ID, now)
+}
+
+func (e *Engine) maybeDispatchScheduledPreview(ctx context.Context, eventID string, now time.Time) {
+	payload, playerIDs := e.prepareScheduledPreview(eventID, now)
+	if payload != "" {
+		e.dispatchPreview(playerIDs, payload)
+		return
+	}
+	def := e.insiderDefinition()
+	if def == nil {
+		return
+	}
+	go func() {
+		previewAt, ok := e.previewAt(eventID)
+		if !ok {
+			return
+		}
+		wait := time.Until(previewAt)
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+		}
+		payload, playerIDs := e.prepareScheduledPreview(eventID, time.Now().UTC())
+		if payload == "" {
+			return
+		}
+		e.dispatchPreview(playerIDs, payload)
+		_ = def
+	}()
+}
+
+func (e *Engine) previewAt(eventID string) (time.Time, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	def := e.insiderDefinitionLocked()
+	if def == nil || e.nextRandomEvent == nil || e.nextRandomEvent.Event.ID != eventID {
+		return time.Time{}, false
+	}
+	return e.nextRandomEvent.Event.ScheduledAt.Add(-time.Duration(def.LeadTimeSeconds) * time.Second), true
+}
+
+func (e *Engine) prepareScheduledPreview(eventID string, now time.Time) (string, []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	def := e.insiderDefinitionLocked()
+	if def == nil || e.nextRandomEvent == nil || e.nextRandomEvent.Event.ID != eventID {
+		return "", nil
+	}
+	if e.nextRandomEvent.PreviewSent {
+		return "", nil
+	}
+	previewAt := e.nextRandomEvent.Event.ScheduledAt.Add(-time.Duration(def.LeadTimeSeconds) * time.Second)
+	if previewAt.After(now) {
+		return "", nil
+	}
+	playerIDs := buyerIDs(e.nextRandomEvent.Buyers)
+	if len(playerIDs) == 0 {
+		e.nextRandomEvent.PreviewSent = true
+		return "", nil
+	}
+	payload := e.buildInsiderPreview(*def, e.nextRandomEvent.Event, now)
+	e.nextRandomEvent.PreviewSent = true
+	return payload, playerIDs
+}
+
+func (e *Engine) dispatchPreview(playerIDs []string, payload string) {
+	if e.notifier == nil || payload == "" {
+		return
+	}
+	for _, playerID := range playerIDs {
+		e.notifier.NotifyPlayer(playerID, payload)
+	}
+}
+
 func (e *Engine) tick(ctx context.Context) {
 	for _, def := range e.orderedDefs {
-		if def.Kind != KindRumor && def.Kind != KindFakeNews && def.Kind != KindInsider {
+		if def.Kind != KindRumor && def.Kind != KindFakeNews {
 			continue
 		}
 		if !e.shouldTrigger(def.Chance) {
@@ -229,10 +385,6 @@ func (e *Engine) tick(ctx context.Context) {
 		}
 		trigger := e.prepareTrigger(def)
 		if !trigger.ok {
-			continue
-		}
-		if def.Kind == KindInsider {
-			e.fireInsider(ctx, def, trigger)
 			continue
 		}
 		_, _ = e.market.TriggerMarketEvent(ctx, exchange.EventShockInput{
@@ -249,13 +401,12 @@ func (e *Engine) tick(ctx context.Context) {
 }
 
 type preparedTrigger struct {
-	ok             bool
-	symbol         string
-	multiplier     int
-	name           string
-	publicMessage  string
-	privateMessage string
-	occurredAt     time.Time
+	ok            bool
+	symbol        string
+	multiplier    int
+	name          string
+	publicMessage string
+	occurredAt    time.Time
 }
 
 func (e *Engine) prepareTrigger(def preparedDefinition) preparedTrigger {
@@ -269,96 +420,62 @@ func (e *Engine) prepareTrigger(def preparedDefinition) preparedTrigger {
 	}
 	multiplier := e.randomBetween(def.Multiplier.Min, def.Multiplier.Max)
 	publicMessage := renderTemplate(def.Message, symbol, multiplier)
-	privateMessage := def.PrivateMessage
-	if strings.TrimSpace(privateMessage) == "" {
-		privateMessage = publicMessage
-	}
-	privateMessage = renderTemplate(privateMessage, symbol, multiplier)
 	return preparedTrigger{
-		ok:             true,
-		symbol:         symbol,
-		multiplier:     multiplier,
-		name:           renderTemplate(def.Name, symbol, multiplier),
-		publicMessage:  publicMessage,
-		privateMessage: privateMessage,
-		occurredAt:     time.Now().UTC(),
+		ok:            true,
+		symbol:        symbol,
+		multiplier:    multiplier,
+		name:          renderTemplate(def.Name, symbol, multiplier),
+		publicMessage: publicMessage,
+		occurredAt:    time.Now().UTC(),
 	}
 }
 
-func (e *Engine) fireInsider(ctx context.Context, def preparedDefinition, trigger preparedTrigger) {
-	lead := time.Duration(def.LeadTimeSeconds) * time.Second
-	playerIDs := e.consumeEntitlements(def.ID)
-	previewAt := trigger.occurredAt
-	publicAt := previewAt.Add(lead)
-	if len(playerIDs) > 0 && e.notifier != nil {
-		preview := marshal(map[string]any{
-			"type":             "intel.insider.preview",
-			"intel_id":         def.ID,
-			"kind":             def.Kind,
-			"name":             trigger.name,
-			"message":          trigger.privateMessage,
-			"symbol":           trigger.symbol,
-			"global":           def.Global,
-			"multiplier_pct":   trigger.multiplier,
-			"duration_seconds": def.DurationSeconds,
-			"scheduled_for":    publicAt,
-			"previewed_at":     previewAt,
-		})
-		for _, playerID := range playerIDs {
-			e.notifier.NotifyPlayer(playerID, preview)
-		}
+func (e *Engine) buildInsiderPreview(def preparedDefinition, event marketevents.PlannedEvent, previewedAt time.Time) string {
+	message := strings.TrimSpace(def.PrivateMessage)
+	if message == "" {
+		message = "The next random market event is locked in. Position before the public tape reacts."
 	}
-	publish := func() {
-		_, _ = e.market.TriggerMarketEvent(ctx, exchange.EventShockInput{
-			Kind:          string(def.Kind),
-			EventName:     trigger.name,
-			Message:       trigger.publicMessage,
-			Global:        def.Global,
-			Symbol:        trigger.symbol,
-			MultiplierPct: trigger.multiplier,
-			Duration:      time.Duration(def.DurationSeconds) * time.Second,
-			OccurredAt:    publicAt,
-		})
-	}
-	if lead <= 0 {
-		publish()
-		return
-	}
-	go func() {
-		timer := time.NewTimer(lead)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-		}
-		publish()
-	}()
+	return marshal(map[string]any{
+		"type":              "intel.insider.preview",
+		"intel_id":          def.ID,
+		"kind":              def.Kind,
+		"name":              event.EventName,
+		"message":           renderTemplate(message, event.Symbol, event.MultiplierPct),
+		"symbol":            event.Symbol,
+		"global":            event.Global,
+		"multiplier_pct":    event.MultiplierPct,
+		"duration_seconds":  event.DurationSeconds,
+		"scheduled_for":     event.ScheduledAt,
+		"previewed_at":      previewedAt,
+		"lead_time_seconds": def.LeadTimeSeconds,
+		"market_event": map[string]any{
+			"id":               event.ID,
+			"kind":             event.Kind,
+			"event_name":       event.EventName,
+			"message":          event.Message,
+			"symbol":           event.Symbol,
+			"global":           event.Global,
+			"multiplier_pct":   event.MultiplierPct,
+			"duration_seconds": event.DurationSeconds,
+			"scheduled_at":     event.ScheduledAt,
+		},
+	})
 }
 
-func (e *Engine) consumeEntitlements(intelID string) []string {
+func (e *Engine) insiderDefinition() *preparedDefinition {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	buyers := e.entitlements[intelID]
-	if len(buyers) == 0 {
-		return nil
-	}
-	playerIDs := make([]string, 0, len(buyers))
-	for playerID, count := range buyers {
-		if count <= 0 {
-			continue
-		}
-		playerIDs = append(playerIDs, playerID)
-		buyers[playerID] = count - 1
-		if buyers[playerID] <= 0 {
-			delete(buyers, playerID)
+	return e.insiderDefinitionLocked()
+}
+
+func (e *Engine) insiderDefinitionLocked() *preparedDefinition {
+	for _, def := range e.orderedDefs {
+		if def.Kind == KindInsider {
+			copyDef := def
+			return &copyDef
 		}
 	}
-	if len(buyers) == 0 {
-		delete(e.entitlements, intelID)
-	}
-	sort.Strings(playerIDs)
-	return playerIDs
+	return nil
 }
 
 func (e *Engine) buildAnalyticsPayload(ctx context.Context, def preparedDefinition) (string, error) {
@@ -487,4 +604,21 @@ func renderTemplate(template string, symbol string, multiplier int) string {
 func marshal(value any) string {
 	raw, _ := json.Marshal(value)
 	return string(raw)
+}
+
+func copyBuyerSet(input map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(input))
+	for playerID := range input {
+		out[playerID] = struct{}{}
+	}
+	return out
+}
+
+func buyerIDs(input map[string]struct{}) []string {
+	out := make([]string, 0, len(input))
+	for playerID := range input {
+		out = append(out, playerID)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -1,17 +1,14 @@
 {
   "feeds": [
     {
-      "id": "insider.musk.buy",
+      "id": "insider.next_event",
       "kind": "insider",
-      "name": "Insider: major buy in <ticker>",
-      "description": "Paid insider access for a specific future event. If it triggers, you will hear about it before the rest of the market.",
-      "message": "Elon Musk bought <ticker>. The crowd is rushing into the bid.",
-      "private_message": "In a few seconds the market will see a headline about <ticker>. Prepare for an upside impulse.",
-      "chance": 6,
+      "name": "Insider: next random event",
+      "description": "Buy once and you will learn the next scheduled random market event 30 seconds before the public tape.",
+      "message": "The next random market event is already scheduled.",
+      "private_message": "Insider preview: the next event is '<ticker>' / '<multiplier>%'. Position before the market reacts.",
       "price": 18000,
-      "market_multiplier": "10-20",
-      "duration_seconds": 75,
-      "lead_time_seconds": 18,
+      "lead_time_seconds": 30,
       "global": false
     },
     {

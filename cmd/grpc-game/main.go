@@ -84,14 +84,6 @@ func main() {
 	}, exchangeService)
 	chartEngine.Start(ctx)
 
-	randomEvents, err := marketevents.NewEngine(marketevents.Config{
-		Interval: time.Duration(runtimeConfig.RandomEventIntervalSecs) * time.Second,
-	}, eventDefs, exchangeService)
-	if err != nil {
-		log.Fatal(err)
-	}
-	randomEvents.Start(ctx)
-
 	gameEngine := gameplay.NewEngine(playerStore, tradeStore, performanceStore, chatStore, allocator, exchangeService, chatService, chartEngine)
 	intelEngine, err := intel.NewEngine(intel.Config{
 		Interval: time.Duration(runtimeConfig.IntelEventIntervalSecs) * time.Second,
@@ -100,6 +92,15 @@ func main() {
 		log.Fatal(err)
 	}
 	gameEngine.SetIntelEngine(intelEngine)
+
+	randomEvents, err := marketevents.NewEngine(marketevents.Config{
+		Interval: time.Duration(runtimeConfig.RandomEventIntervalSecs) * time.Second,
+	}, eventDefs, exchangeService, intelEngine)
+	if err != nil {
+		log.Fatal(err)
+	}
+	randomEvents.Start(ctx)
+
 	intelEngine.Start(ctx)
 
 	api := grpcapi.New(gameEngine)

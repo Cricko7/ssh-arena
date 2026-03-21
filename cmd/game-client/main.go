@@ -51,6 +51,14 @@ type actionResponseMsg struct {
 	json     string
 }
 
+type intelCatalogItem struct {
+	ID          string `json:"id"`
+	Kind        string `json:"kind"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Price       int64  `json:"price"`
+}
+
 type portfolioSnapshot struct {
 	Type           string           `json:"type"`
 	PlayerID       string           `json:"player_id"`
@@ -112,6 +120,8 @@ type uiState struct {
 	chatInput      string
 	chatScroll     int
 	chatFocus      bool
+	insiderOffer   *intelCatalogItem
+	insiderRect    tickerRect
 	banner         *eventBanner
 }
 
@@ -285,6 +295,7 @@ func main() {
 
 	colors := newPalette()
 	requestPortfolioAsync(cfg, events)
+	requestIntelCatalogAsync(cfg, events)
 	portfolioTicker := time.NewTicker(4 * time.Second)
 	defer portfolioTicker.Stop()
 	uiTicker := time.NewTicker(120 * time.Millisecond)
@@ -313,6 +324,14 @@ func main() {
 				state.status = msg.text
 			case marketEventMsg:
 				activateMarketEvent(&state, msg.event)
+			case chatEntryMsg:
+				appendChatEntry(&state, msg.entry)
+				if msg.entry.Type == "intel.insider.preview" {
+					state.status = "insider preview received"
+				}
+			case streamPortfolioMsg:
+				state.portfolio = msg.snapshot
+				state.hasPortfolio = true
 			case errMsg:
 				state.status = "error: " + msg.err.Error()
 			}
@@ -330,7 +349,7 @@ func main() {
 				running = handleKeyEvent(e, &state, cfg, events)
 				render(screen, colors, &state)
 			case *tcell.EventMouse:
-				handleMouseEvent(e, &state)
+				handleMouseEvent(e, &state, cfg, events)
 				render(screen, colors, &state)
 			}
 		case <-portfolioTicker.C:
@@ -532,6 +551,8 @@ func handleKeyEvent(ev *tcell.EventKey, state *uiState, cfg config, events chan<
 			openTicket(state, "sell")
 		case r == 'r' || r == 'R':
 			requestPortfolioAsync(cfg, events)
+		case r == 'i' || r == 'I':
+			buyInsiderAsync(cfg, state, events)
 		}
 	}
 	return true
@@ -653,6 +674,20 @@ func requestPortfolioAsync(cfg config, events chan<- any) {
 	go executeActionAsync(cfg, "portfolio.get", map[string]any{}, events)
 }
 
+func requestIntelCatalogAsync(cfg config, events chan<- any) {
+	go executeActionAsync(cfg, "intel.catalog", map[string]any{}, events)
+}
+
+func buyInsiderAsync(cfg config, state *uiState, events chan<- any) {
+	if state.insiderOffer == nil {
+		state.status = "loading insider catalog..."
+		requestIntelCatalogAsync(cfg, events)
+		return
+	}
+	state.status = fmt.Sprintf("buying insider preview for %.2f...", moneyValue(state.insiderOffer.Price))
+	go executeActionAsync(cfg, "intel.buy", map[string]any{"intel_id": state.insiderOffer.ID}, events)
+}
+
 func executeActionAsync(cfg config, actionID string, payload any, events chan<- any) {
 	response, err := executeActionJSON(cfg, actionID, payload)
 	if err != nil {
@@ -709,6 +744,25 @@ func applyActionResponse(state *uiState, msg actionResponseMsg) {
 			return
 		}
 	}
+	if msg.actionID == "intel.catalog" {
+		var payload struct {
+			Type  string             `json:"type"`
+			Items []intelCatalogItem `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(msg.json), &payload); err == nil {
+			state.insiderOffer = nil
+			for idx := range payload.Items {
+				if payload.Items[idx].Kind == "insider" {
+					item := payload.Items[idx]
+					state.insiderOffer = &item
+					state.status = fmt.Sprintf("insider preview ready: %.2f", moneyValue(item.Price))
+					return
+				}
+			}
+			state.status = "intel catalog loaded"
+			return
+		}
+	}
 	if msg.actionID == "place_order" {
 		var result struct {
 			Type      string            `json:"type"`
@@ -720,6 +774,37 @@ func applyActionResponse(state *uiState, msg actionResponseMsg) {
 				state.hasPortfolio = true
 			}
 			state.status = "order accepted"
+			return
+		}
+	}
+	if msg.actionID == "intel.buy" {
+		var result struct {
+			Type      string            `json:"type"`
+			Cost      int64             `json:"cost"`
+			Portfolio portfolioSnapshot `json:"portfolio"`
+			Payload   struct {
+				Type         string    `json:"type"`
+				Message      string    `json:"message"`
+				ScheduledFor time.Time `json:"scheduled_for"`
+			} `json:"payload"`
+		}
+		if err := json.Unmarshal([]byte(msg.json), &result); err == nil {
+			if result.Portfolio.Type == "portfolio.snapshot" {
+				state.portfolio = result.Portfolio
+				state.hasPortfolio = true
+			}
+			switch result.Payload.Type {
+			case "intel.purchase.armed":
+				if !result.Payload.ScheduledFor.IsZero() {
+					state.status = fmt.Sprintf("insider armed: preview before %s", result.Payload.ScheduledFor.Local().Format("15:04:05"))
+				} else {
+					state.status = fmt.Sprintf("insider armed for next event (%.2f)", moneyValue(result.Cost))
+				}
+			case "intel.insider.preview":
+				state.status = "insider preview delivered"
+			default:
+				state.status = fmt.Sprintf("intel purchased for %.2f", moneyValue(result.Cost))
+			}
 			return
 		}
 	}
@@ -828,7 +913,7 @@ func panStep(state *uiState) int {
 	return max(4, visible/6)
 }
 
-func handleMouseEvent(ev *tcell.EventMouse, state *uiState) {
+func handleMouseEvent(ev *tcell.EventMouse, state *uiState, cfg config, events chan<- any) {
 	x, y := ev.Position()
 	buttons := ev.Buttons()
 	insideChat := x >= state.chatRect.X1 && x <= state.chatRect.X2 && y >= state.chatRect.Y1 && y <= state.chatRect.Y2
@@ -862,6 +947,10 @@ func handleMouseEvent(ev *tcell.EventMouse, state *uiState) {
 		state.status = "chat input focused"
 		return
 	}
+	if state.insiderRect.X2 > state.insiderRect.X1 && x >= state.insiderRect.X1 && x <= state.insiderRect.X2 && y >= state.insiderRect.Y1 && y <= state.insiderRect.Y2 {
+		buyInsiderAsync(cfg, state, events)
+		return
+	}
 	for _, rect := range state.orderbookRects {
 		if x >= rect.X1 && x <= rect.X2 && y >= rect.Y1 && y <= rect.Y2 {
 			if rect.Side == "ask" {
@@ -887,6 +976,7 @@ func render(screen tcell.Screen, colors palette, state *uiState) {
 	w, h := screen.Size()
 	state.tickerRects = state.tickerRects[:0]
 	state.orderbookRects = state.orderbookRects[:0]
+	state.insiderRect = tickerRect{}
 	screen.SetStyle(colors.background)
 	screen.Clear()
 
@@ -1059,6 +1149,21 @@ func renderSidebar(screen tcell.Screen, colors palette, rect tickerRect, symbol 
 	}
 
 	y++
+	drawText(screen, rect.X1+2, y, colors.headerOn(colors.panelAltBG), "intel")
+	y++
+	if state.insiderOffer != nil {
+		label := fmt.Sprintf("i buy preview %.2f", moneyValue(state.insiderOffer.Price))
+		state.insiderRect = tickerRect{X1: rect.X1 + 2, Y1: y, X2: min(rect.X2-2, rect.X1+2+runeLen(label)-1), Y2: y}
+		drawText(screen, rect.X1+2, y, colors.accentOn(colors.panelAltBG), truncate(label, max(1, rect.X2-rect.X1-4)))
+		y++
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "next random event 30s early")
+		y++
+	} else {
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "loading insider catalog...")
+		y++
+	}
+
+	y++
 	drawText(screen, rect.X1+2, y, colors.headerOn(colors.panelAltBG), "ticket")
 	y++
 	if state.ticket.Active {
@@ -1075,7 +1180,7 @@ func renderSidebar(screen tcell.Screen, colors palette, rect tickerRect, symbol 
 		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "Tab switch | Enter send | Esc close | click book level")
 		y++
 	} else {
-		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "b buy | s sell | r refresh")
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "b buy | s sell | i insider | r refresh")
 		y++
 	}
 

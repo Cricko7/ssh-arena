@@ -24,6 +24,14 @@ func (m *mockMarket) TriggerMarketEvent(_ context.Context, input exchange.EventS
 	return exchange.EventShockOutput{}, nil
 }
 
+type mockScheduler struct {
+	planned []PlannedEvent
+}
+
+func (m *mockScheduler) ScheduleNextRandomEvent(_ context.Context, event PlannedEvent) {
+	m.planned = append(m.planned, event)
+}
+
 func TestParseRange(t *testing.T) {
 	cases := []struct {
 		value string
@@ -48,8 +56,9 @@ func TestParseRange(t *testing.T) {
 	}
 }
 
-func TestEngineTickTriggersLocalEvent(t *testing.T) {
+func TestEnginePlansAndTriggersNextEvent(t *testing.T) {
 	market := &mockMarket{tickers: []string{"TECH", "FOOD"}}
+	scheduler := &mockScheduler{}
 	engine, err := NewEngine(Config{Interval: time.Second}, []Definition{{
 		Name:             "Elon buys <ticker>",
 		Message:          "Elon buys <ticker>",
@@ -57,7 +66,7 @@ func TestEngineTickTriggersLocalEvent(t *testing.T) {
 		MarketMultiplier: "10-10",
 		DurationSeconds:  60,
 		Global:           false,
-	}}, market)
+	}}, market, scheduler)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -65,21 +74,31 @@ func TestEngineTickTriggersLocalEvent(t *testing.T) {
 	engine.rng = rand.New(rand.NewSource(1))
 	engine.mu.Unlock()
 
-	engine.tick(context.Background())
+	now := time.Now().UTC()
+	engine.step(context.Background(), now)
+	if len(scheduler.planned) != 1 {
+		t.Fatalf("expected one planned event, got %d", len(scheduler.planned))
+	}
+	planned := scheduler.planned[0]
+	if planned.Symbol == "" {
+		t.Fatal("expected a ticker to be selected for the next event")
+	}
+	if !strings.Contains(planned.Message, planned.Symbol) {
+		t.Fatalf("expected planned message %q to include symbol %q", planned.Message, planned.Symbol)
+	}
+	if planned.MultiplierPct != 10 {
+		t.Fatalf("expected multiplier 10, got %d", planned.MultiplierPct)
+	}
+
+	engine.step(context.Background(), planned.ScheduledAt)
 	if len(market.calls) != 1 {
 		t.Fatalf("expected 1 event call, got %d", len(market.calls))
 	}
 	call := market.calls[0]
-	if call.Global {
-		t.Fatalf("expected local event")
+	if call.Symbol != planned.Symbol || call.MultiplierPct != planned.MultiplierPct {
+		t.Fatalf("unexpected triggered event: %+v vs planned %+v", call, planned)
 	}
-	if call.Symbol == "" {
-		t.Fatalf("expected random ticker to be selected")
-	}
-	if !strings.Contains(call.Message, call.Symbol) {
-		t.Fatalf("expected message %q to include symbol %q", call.Message, call.Symbol)
-	}
-	if call.MultiplierPct != 10 {
-		t.Fatalf("expected exact multiplier 10, got %d", call.MultiplierPct)
+	if len(scheduler.planned) < 2 {
+		t.Fatalf("expected next event to be planned immediately after fire, got %d plans", len(scheduler.planned))
 	}
 }

@@ -31,6 +31,19 @@ type Range struct {
 	Max int
 }
 
+type PlannedEvent struct {
+	ID              string        `json:"id"`
+	Kind            string        `json:"kind"`
+	EventName       string        `json:"event_name"`
+	Message         string        `json:"message"`
+	Global          bool          `json:"global"`
+	Symbol          string        `json:"symbol,omitempty"`
+	MultiplierPct   int           `json:"multiplier_pct"`
+	Duration        time.Duration `json:"-"`
+	DurationSeconds int           `json:"duration_seconds"`
+	ScheduledAt     time.Time     `json:"scheduled_at"`
+}
+
 type preparedDefinition struct {
 	Definition
 	Multiplier Range
@@ -40,12 +53,20 @@ type Config struct {
 	Interval time.Duration
 }
 
+type PreviewScheduler interface {
+	ScheduleNextRandomEvent(context.Context, PlannedEvent)
+}
+
 type Engine struct {
-	cfg    Config
-	market Market
-	mu     sync.Mutex
-	rng    *rand.Rand
-	defs   []preparedDefinition
+	cfg      Config
+	market   Market
+	schedule PreviewScheduler
+
+	mu      sync.Mutex
+	rng     *rand.Rand
+	defs    []preparedDefinition
+	planned *PlannedEvent
+	nextSeq int64
 }
 
 type Market interface {
@@ -84,9 +105,9 @@ func ParseRange(value string) (Range, error) {
 	return Range{}, fmt.Errorf("invalid multiplier range %q", value)
 }
 
-func NewEngine(cfg Config, defs []Definition, market Market) (*Engine, error) {
+func NewEngine(cfg Config, defs []Definition, market Market, scheduler PreviewScheduler) (*Engine, error) {
 	if cfg.Interval <= 0 {
-		cfg.Interval = 15 * time.Second
+		cfg.Interval = 30 * time.Second
 	}
 	prepared := make([]preparedDefinition, 0, len(defs))
 	for _, def := range defs {
@@ -104,10 +125,11 @@ func NewEngine(cfg Config, defs []Definition, market Market) (*Engine, error) {
 	}
 
 	return &Engine{
-		cfg:    cfg,
-		market: market,
-		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
-		defs:   prepared,
+		cfg:      cfg,
+		market:   market,
+		schedule: scheduler,
+		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		defs:     prepared,
 	}, nil
 }
 
@@ -118,75 +140,155 @@ func (e *Engine) Start(ctx context.Context) {
 	go e.run(ctx)
 }
 
+func (e *Engine) PeekNext() (PlannedEvent, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.planned == nil {
+		return PlannedEvent{}, false
+	}
+	return *e.planned, true
+}
+
 func (e *Engine) run(ctx context.Context) {
-	ticker := time.NewTicker(e.cfg.Interval)
+	poll := e.cfg.Interval / 4
+	if poll <= 0 || poll > time.Second {
+		poll = time.Second
+	}
+	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 
+	e.step(ctx, time.Now().UTC())
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			e.tick(ctx)
+		case now := <-ticker.C:
+			e.step(ctx, now.UTC())
 		}
 	}
 }
 
-func (e *Engine) tick(ctx context.Context) {
+func (e *Engine) step(ctx context.Context, now time.Time) {
+	plans := make([]PlannedEvent, 0, 2)
+	var fire *PlannedEvent
+
+	e.mu.Lock()
+	if e.planned == nil {
+		if planned := e.planLocked(now); planned != nil {
+			e.planned = planned
+			plans = append(plans, *planned)
+		}
+	}
+	if e.planned != nil && !now.Before(e.planned.ScheduledAt) {
+		fireCopy := *e.planned
+		fire = &fireCopy
+		e.planned = nil
+		if planned := e.planLocked(now); planned != nil {
+			e.planned = planned
+			plans = append(plans, *planned)
+		}
+	}
+	e.mu.Unlock()
+
+	for _, planned := range plans {
+		if e.schedule != nil {
+			e.schedule.ScheduleNextRandomEvent(ctx, planned)
+		}
+	}
+	if fire != nil {
+		e.fire(ctx, *fire)
+	}
+}
+
+func (e *Engine) fire(ctx context.Context, planned PlannedEvent) {
+	_, _ = e.market.TriggerMarketEvent(ctx, exchange.EventShockInput{
+		Kind:          planned.Kind,
+		EventName:     planned.EventName,
+		Message:       planned.Message,
+		Global:        planned.Global,
+		Symbol:        planned.Symbol,
+		MultiplierPct: planned.MultiplierPct,
+		Duration:      planned.Duration,
+		OccurredAt:    planned.ScheduledAt,
+	})
+}
+
+func (e *Engine) planLocked(now time.Time) *PlannedEvent {
+	def, ok := e.chooseDefinitionLocked()
+	if !ok {
+		return nil
+	}
+	tickers := e.market.ListTickers()
+	if len(tickers) == 0 {
+		return nil
+	}
+
+	symbol := ""
+	if !def.Global {
+		symbol = tickers[e.randomIntLocked(len(tickers))]
+	}
+	multiplierPct := e.randomBetweenLocked(def.Multiplier.Min, def.Multiplier.Max)
+	message := renderTemplate(def.Message, symbol, multiplierPct)
+	name := renderTemplate(def.Name, symbol, multiplierPct)
+	if strings.TrimSpace(message) == "" {
+		message = name
+	}
+	e.nextSeq++
+	planned := PlannedEvent{
+		ID:              fmt.Sprintf("random-event-%d", e.nextSeq),
+		Kind:            "random_event",
+		EventName:       name,
+		Message:         message,
+		Global:          def.Global,
+		Symbol:          symbol,
+		MultiplierPct:   multiplierPct,
+		Duration:        time.Duration(def.DurationSeconds) * time.Second,
+		DurationSeconds: def.DurationSeconds,
+		ScheduledAt:     now.Add(e.cfg.Interval),
+	}
+	return &planned
+}
+
+func (e *Engine) chooseDefinitionLocked() (preparedDefinition, bool) {
+	total := 0.0
 	for _, def := range e.defs {
-		if !e.shouldTrigger(def.Chance) {
+		if def.Chance > 0 {
+			total += def.Chance
+		}
+	}
+	if total <= 0 {
+		return preparedDefinition{}, false
+	}
+	roll := e.rng.Float64() * total
+	cumulative := 0.0
+	for _, def := range e.defs {
+		if def.Chance <= 0 {
 			continue
 		}
-		tickers := e.market.ListTickers()
-		if len(tickers) == 0 {
-			return
+		cumulative += def.Chance
+		if roll <= cumulative {
+			return def, true
 		}
-		symbol := ""
-		if !def.Global {
-			symbol = tickers[e.randomInt(len(tickers))]
-		}
-		multiplierPct := e.randomBetween(def.Multiplier.Min, def.Multiplier.Max)
-		message := def.Message
-		if symbol != "" {
-			message = strings.ReplaceAll(message, "<ticker>", symbol)
-			message = strings.ReplaceAll(message, "<TICKER>", symbol)
-		}
-		_, _ = e.market.TriggerMarketEvent(ctx, exchange.EventShockInput{
-			Kind:          "random_event",
-			EventName:     def.Name,
-			Message:       message,
-			Global:        def.Global,
-			Symbol:        symbol,
-			MultiplierPct: multiplierPct,
-			Duration:      time.Duration(def.DurationSeconds) * time.Second,
-			OccurredAt:    time.Now().UTC(),
-		})
 	}
+	return e.defs[len(e.defs)-1], true
 }
 
-func (e *Engine) shouldTrigger(chance float64) bool {
-	if chance <= 0 {
-		return false
-	}
-	if chance >= 100 {
-		return true
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.rng.Float64()*100.0 < chance
-}
-
-func (e *Engine) randomInt(max int) int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+func (e *Engine) randomIntLocked(max int) int {
 	return e.rng.Intn(max)
 }
 
-func (e *Engine) randomBetween(minValue, maxValue int) int {
+func (e *Engine) randomBetweenLocked(minValue, maxValue int) int {
 	if minValue >= maxValue {
 		return minValue
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	return minValue + e.rng.Intn(maxValue-minValue+1)
+}
+
+func renderTemplate(template string, symbol string, multiplier int) string {
+	replacer := strings.NewReplacer(
+		"<ticker>", symbol,
+		"<TICKER>", symbol,
+		"<multiplier>", fmt.Sprintf("%d", multiplier),
+	)
+	return replacer.Replace(template)
 }
