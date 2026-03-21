@@ -46,6 +46,33 @@ type errMsg struct{ err error }
 
 type statusMsg struct{ text string }
 
+type actionResponseMsg struct {
+	actionID string
+	json     string
+}
+
+type portfolioSnapshot struct {
+	Type           string           `json:"type"`
+	PlayerID       string           `json:"player_id"`
+	Username       string           `json:"username"`
+	Role           string           `json:"role"`
+	Cash           int64            `json:"cash"`
+	ReservedCash   int64            `json:"reserved_cash"`
+	AvailableCash  int64            `json:"available_cash"`
+	Portfolio      map[string]int64 `json:"portfolio"`
+	ReservedStocks map[string]int64 `json:"reserved_stocks"`
+	AvailableStock map[string]int64 `json:"available_stock"`
+}
+
+type orderTicket struct {
+	Active    bool
+	Side      string
+	OrderType string
+	Price     string
+	Quantity  string
+	Field     int
+}
+
 type tickerRect struct {
 	Symbol string
 	X1     int
@@ -54,17 +81,38 @@ type tickerRect struct {
 	Y2     int
 }
 
+type orderbookRect struct {
+	Side     string
+	Price    float64
+	Quantity int64
+	X1       int
+	Y1       int
+	X2       int
+	Y2       int
+}
+
 type uiState struct {
-	cfg           config
-	selected      int
-	status        string
-	playerLabel   string
-	endpointLabel string
-	ticks         map[string]charting.PriceChartTick
-	tickerRects   []tickerRect
-	chartZoom     int
-	chartOffset   int
-	timeframe     int
+	cfg            config
+	selected       int
+	status         string
+	playerLabel    string
+	endpointLabel  string
+	ticks          map[string]charting.PriceChartTick
+	tickerRects    []tickerRect
+	orderbookRects []orderbookRect
+	portfolio      portfolioSnapshot
+	hasPortfolio   bool
+	ticket         orderTicket
+	chartZoom      int
+	chartOffset    int
+	timeframe      int
+	chatRect       tickerRect
+	chatNameRects  []chatNameRect
+	chatLines      []chatEntry
+	chatInput      string
+	chatScroll     int
+	chatFocus      bool
+	banner         *eventBanner
 }
 
 type palette struct {
@@ -197,6 +245,7 @@ func main() {
 
 	events := make(chan any, 256)
 	go startChartStream(ctx, cfg, events)
+	go startMarketStream(ctx, cfg, events)
 
 	screen, err := tcell.NewScreen()
 	if err != nil {
@@ -235,6 +284,11 @@ func main() {
 	}()
 
 	colors := newPalette()
+	requestPortfolioAsync(cfg, events)
+	portfolioTicker := time.NewTicker(4 * time.Second)
+	defer portfolioTicker.Stop()
+	uiTicker := time.NewTicker(120 * time.Millisecond)
+	defer uiTicker.Stop()
 	render(screen, colors, &state)
 
 	running := true
@@ -247,6 +301,8 @@ func main() {
 				continue
 			}
 			switch msg := raw.(type) {
+			case actionResponseMsg:
+				applyActionResponse(&state, msg)
 			case chartTickMsg:
 				state.ticks[msg.tick.Ticker] = msg.tick
 				clampViewport(&state)
@@ -255,6 +311,8 @@ func main() {
 				}
 			case statusMsg:
 				state.status = msg.text
+			case marketEventMsg:
+				activateMarketEvent(&state, msg.event)
 			case errMsg:
 				state.status = "error: " + msg.err.Error()
 			}
@@ -269,10 +327,16 @@ func main() {
 				screen.Sync()
 				render(screen, colors, &state)
 			case *tcell.EventKey:
-				running = handleKeyEvent(e, &state)
+				running = handleKeyEvent(e, &state, cfg, events)
 				render(screen, colors, &state)
 			case *tcell.EventMouse:
 				handleMouseEvent(e, &state)
+				render(screen, colors, &state)
+			}
+		case <-portfolioTicker.C:
+			requestPortfolioAsync(cfg, events)
+		case <-uiTicker.C:
+			if bannerActive(&state, time.Now()) {
 				render(screen, colors, &state)
 			}
 		case <-ctx.Done():
@@ -357,17 +421,25 @@ func resolveConfig() (config, string, error) {
 		if cfg.Username == "" {
 			cfg.Username = bootstrap.Username
 		}
+		playerLabel = fmt.Sprintf("%s (%s) %s", bootstrap.Username, bootstrap.Role, bootstrap.PlayerID)
 		portfolioSymbols := make([]string, 0, len(bootstrap.Portfolio))
 		for symbol := range bootstrap.Portfolio {
 			portfolioSymbols = append(portfolioSymbols, symbol)
 		}
-		cfg.Symbols = normalizeSymbols(*symbolsFlag, mergeFallback(profile.Symbols, portfolioSymbols))
-		playerLabel = fmt.Sprintf("%s (%s) %s", bootstrap.Username, bootstrap.Role, bootstrap.PlayerID)
+		serverSymbols, err := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
+		if err != nil {
+			log.Printf("warning: fetch market catalog: %v", err)
+		}
+		cfg.Symbols = normalizeSymbols(*symbolsFlag, mergeFallback(mergeFallback(profile.Symbols, portfolioSymbols), serverSymbols))
 	} else {
-		cfg.Symbols = normalizeSymbols(*symbolsFlag, profile.Symbols)
 		if cfg.GRPCAddr == "" {
 			cfg.GRPCAddr = "localhost:9090"
 		}
+		serverSymbols, err := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
+		if err != nil {
+			log.Printf("warning: fetch market catalog: %v", err)
+		}
+		cfg.Symbols = normalizeSymbols(*symbolsFlag, mergeFallback(profile.Symbols, serverSymbols))
 		if cfg.Username != "" {
 			playerLabel = fmt.Sprintf("%s %s", cfg.Username, cfg.PlayerID)
 		} else {
@@ -375,11 +447,11 @@ func resolveConfig() (config, string, error) {
 		}
 	}
 
-	if len(cfg.Symbols) == 0 {
-		cfg.Symbols = []string{"TECH", "ENERGY", "FOOD", "CRYPTO", "DEFENSE", "PHARMA", "ENTERTAINMENT", "TRANSPORT"}
-	}
 	if cfg.GRPCAddr == "" {
 		cfg.GRPCAddr = "localhost:9090"
+	}
+	if len(cfg.Symbols) == 0 {
+		return config{}, "", fmt.Errorf("server returned no market symbols")
 	}
 	if cfg.Initial == "" || indexOfSymbol(cfg.Symbols, cfg.Initial) < 0 {
 		cfg.Initial = cfg.Symbols[0]
@@ -399,7 +471,13 @@ func resolveConfig() (config, string, error) {
 	return cfg, playerLabel, nil
 }
 
-func handleKeyEvent(ev *tcell.EventKey, state *uiState) bool {
+func handleKeyEvent(ev *tcell.EventKey, state *uiState, cfg config, events chan<- any) bool {
+	if state.ticket.Active {
+		return handleTicketKeyEvent(ev, state, cfg, events)
+	}
+	if state.chatFocus {
+		return handleChatKeyEvent(ev, state, cfg, events)
+	}
 	switch ev.Key() {
 	case tcell.KeyCtrlC, tcell.KeyEscape:
 		return false
@@ -446,13 +524,240 @@ func handleKeyEvent(ev *tcell.EventKey, state *uiState) bool {
 			resetViewport(state)
 		case r == '[' || r == '{' || r == 'w' || r == 'W':
 			shiftTimeframe(state, -1)
-		case r == ']' || r == '}' || r == 's' || r == 'S':
+		case r == ']' || r == '}' || r == 't' || r == 'T':
 			shiftTimeframe(state, 1)
+		case r == 'b' || r == 'B':
+			openTicket(state, "buy")
+		case r == 's' || r == 'S':
+			openTicket(state, "sell")
+		case r == 'r' || r == 'R':
+			requestPortfolioAsync(cfg, events)
 		}
 	}
 	return true
 }
 
+func handleTicketKeyEvent(ev *tcell.EventKey, state *uiState, cfg config, events chan<- any) bool {
+	switch ev.Key() {
+	case tcell.KeyEscape:
+		state.ticket = orderTicket{}
+		state.status = "ticket closed"
+		return true
+	case tcell.KeyTab:
+		state.ticket.Field = (state.ticket.Field + 1) % 3
+		return true
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		switch state.ticket.Field {
+		case 1:
+			if len(state.ticket.Price) > 0 {
+				state.ticket.Price = state.ticket.Price[:len(state.ticket.Price)-1]
+			}
+		case 2:
+			if len(state.ticket.Quantity) > 0 {
+				state.ticket.Quantity = state.ticket.Quantity[:len(state.ticket.Quantity)-1]
+			}
+		}
+		return true
+	case tcell.KeyEnter:
+		submitOrderAsync(cfg, state, events)
+		return true
+	case tcell.KeyRune:
+		r := ev.Rune()
+		switch {
+		case r == 'q' || r == 'Q':
+			state.ticket = orderTicket{}
+			state.status = "ticket closed"
+			return true
+		case state.ticket.Field == 0 && (r == 'm' || r == 'M'):
+			state.ticket.OrderType = "market"
+			return true
+		case state.ticket.Field == 0 && (r == 'l' || r == 'L'):
+			state.ticket.OrderType = "limit"
+			return true
+		case state.ticket.Field == 1 && ((r >= '0' && r <= '9') || r == '.'):
+			state.ticket.Price += string(r)
+			return true
+		case state.ticket.Field == 2 && r >= '0' && r <= '9':
+			state.ticket.Quantity += string(r)
+			return true
+		}
+	}
+	return true
+}
+
+func openTicket(state *uiState, side string) {
+	current := currentSymbol(state.cfg.Symbols, state.selected)
+	price := "0.00"
+	if tick, ok := state.ticks[current]; ok && tick.CurrentPrice > 0 {
+		price = fmt.Sprintf("%.2f", tick.CurrentPrice)
+	}
+	state.ticket = orderTicket{
+		Active:    true,
+		Side:      side,
+		OrderType: "limit",
+		Price:     price,
+		Quantity:  "1",
+		Field:     1,
+	}
+	state.status = fmt.Sprintf("%s ticket ready", strings.ToUpper(side))
+}
+
+func openBookTicket(state *uiState, side string, price float64, qty int64) {
+	if qty <= 0 {
+		qty = 1
+	}
+	state.ticket = orderTicket{
+		Active:    true,
+		Side:      side,
+		OrderType: "limit",
+		Price:     fmt.Sprintf("%.2f", price),
+		Quantity:  fmt.Sprintf("%d", qty),
+		Field:     2,
+	}
+	state.status = fmt.Sprintf("%s %d @ %.2f ready", strings.ToUpper(side), qty, price)
+}
+func submitOrderAsync(cfg config, state *uiState, events chan<- any) {
+	priceRaw, qty, err := buildOrderPayload(state)
+	if err != nil {
+		events <- errMsg{err: err}
+		return
+	}
+	payload := map[string]any{
+		"symbol":   currentSymbol(state.cfg.Symbols, state.selected),
+		"side":     state.ticket.Side,
+		"type":     state.ticket.OrderType,
+		"price":    priceRaw,
+		"quantity": qty,
+	}
+	state.status = fmt.Sprintf("submitting %s order...", state.ticket.Side)
+	state.ticket = orderTicket{}
+	go executeActionAsync(cfg, "place_order", payload, events)
+}
+
+func buildOrderPayload(state *uiState) (int64, int64, error) {
+	qty, err := parseWholeUnits(state.ticket.Quantity)
+	if err != nil || qty <= 0 {
+		return 0, 0, fmt.Errorf("quantity must be a positive integer")
+	}
+	if state.ticket.OrderType == "market" {
+		return 0, qty, nil
+	}
+	price, err := parseMoneyToCents(state.ticket.Price)
+	if err != nil || price <= 0 {
+		return 0, 0, fmt.Errorf("price must be a positive number")
+	}
+	return price, qty, nil
+}
+
+func requestPortfolioAsync(cfg config, events chan<- any) {
+	go executeActionAsync(cfg, "portfolio.get", map[string]any{}, events)
+}
+
+func executeActionAsync(cfg config, actionID string, payload any, events chan<- any) {
+	response, err := executeActionJSON(cfg, actionID, payload)
+	if err != nil {
+		events <- errMsg{err: err}
+		return
+	}
+	events <- actionResponseMsg{actionID: actionID, json: response}
+}
+
+func executeActionJSON(cfg config, actionID string, payload any) (string, error) {
+	grpcjson.Register()
+	codec := encoding.GetCodec("json")
+	if codec == nil {
+		return "", fmt.Errorf("json gRPC codec is not registered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, cfg.GRPCAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(codec)),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return "", fmt.Errorf("grpc dial: %w", err)
+	}
+	defer conn.Close()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	api := gamev1.NewGameServiceClient(conn)
+	resp, err := api.ExecuteAction(ctx, &gamev1.ActionRequest{
+		RequestID:   fmt.Sprintf("ui-%d", time.Now().UnixNano()),
+		PlayerID:    cfg.PlayerID,
+		ActionID:    actionID,
+		PayloadJSON: string(raw),
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp.Status != "ok" {
+		return "", fmt.Errorf("%s", extractErrorMessage(resp.ResponseJSON))
+	}
+	return resp.ResponseJSON, nil
+}
+
+func applyActionResponse(state *uiState, msg actionResponseMsg) {
+	if msg.actionID == "portfolio.get" {
+		var snapshot portfolioSnapshot
+		if err := json.Unmarshal([]byte(msg.json), &snapshot); err == nil && snapshot.Type == "portfolio.snapshot" {
+			state.portfolio = snapshot
+			state.hasPortfolio = true
+			state.status = fmt.Sprintf("portfolio refreshed: cash %.2f", moneyValue(snapshot.AvailableCash))
+			return
+		}
+	}
+	if msg.actionID == "place_order" {
+		var result struct {
+			Type      string            `json:"type"`
+			Portfolio portfolioSnapshot `json:"portfolio"`
+		}
+		if err := json.Unmarshal([]byte(msg.json), &result); err == nil {
+			if result.Portfolio.Type == "portfolio.snapshot" {
+				state.portfolio = result.Portfolio
+				state.hasPortfolio = true
+			}
+			state.status = "order accepted"
+			return
+		}
+	}
+	state.status = "action completed"
+}
+
+func parseWholeUnits(raw string) (int64, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	var out int64
+	_, err := fmt.Sscanf(value, "%d", &out)
+	return out, err
+}
+
+func parseMoneyToCents(raw string) (int64, error) {
+	value := strings.TrimSpace(strings.ReplaceAll(raw, ",", "."))
+	if value == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	var amount float64
+	_, err := fmt.Sscanf(value, "%f", &amount)
+	if err != nil {
+		return 0, err
+	}
+	return int64(math.Round(amount * 100)), nil
+}
+
+func extractErrorMessage(raw string) string {
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err == nil && payload.Message != "" {
+		return payload.Message
+	}
+	return raw
+}
 func moveSelection(state *uiState, delta int, prefix string) {
 	if len(state.cfg.Symbols) == 0 {
 		return
@@ -524,19 +829,49 @@ func panStep(state *uiState) int {
 }
 
 func handleMouseEvent(ev *tcell.EventMouse, state *uiState) {
+	x, y := ev.Position()
 	buttons := ev.Buttons()
+	insideChat := x >= state.chatRect.X1 && x <= state.chatRect.X2 && y >= state.chatRect.Y1 && y <= state.chatRect.Y2
 	switch {
 	case buttons&tcell.WheelUp != 0:
-		zoomChart(state, 1)
+		if insideChat {
+			scrollChat(state, 3)
+		} else {
+			zoomChart(state, 1)
+		}
 		return
 	case buttons&tcell.WheelDown != 0:
-		zoomChart(state, -1)
+		if insideChat {
+			scrollChat(state, -3)
+		} else {
+			zoomChart(state, -1)
+		}
 		return
 	case buttons&tcell.Button1 == 0:
 		return
 	}
 
-	x, y := ev.Position()
+	if insideChat {
+		for _, rect := range state.chatNameRects {
+			if x >= rect.X1 && x <= rect.X2 && y >= rect.Y1 && y <= rect.Y2 {
+				copyPlayerIDIntoChat(state, rect)
+				return
+			}
+		}
+		state.chatFocus = true
+		state.status = "chat input focused"
+		return
+	}
+	for _, rect := range state.orderbookRects {
+		if x >= rect.X1 && x <= rect.X2 && y >= rect.Y1 && y <= rect.Y2 {
+			if rect.Side == "ask" {
+				openBookTicket(state, "buy", rect.Price, rect.Quantity)
+			} else {
+				openBookTicket(state, "sell", rect.Price, rect.Quantity)
+			}
+			return
+		}
+	}
 	for idx, rect := range state.tickerRects {
 		if x >= rect.X1 && x <= rect.X2 && y >= rect.Y1 && y <= rect.Y2 {
 			state.selected = idx
@@ -551,17 +886,24 @@ func handleMouseEvent(ev *tcell.EventMouse, state *uiState) {
 func render(screen tcell.Screen, colors palette, state *uiState) {
 	w, h := screen.Size()
 	state.tickerRects = state.tickerRects[:0]
+	state.orderbookRects = state.orderbookRects[:0]
 	screen.SetStyle(colors.background)
 	screen.Clear()
 
-	drawText(screen, 2, 0, colors.headerAccent, "SSH ARENA")
-	drawText(screen, 13, 0, colors.header, "market terminal")
-	drawText(screen, 2, 1, colors.muted, truncate(state.playerLabel, max(1, w-4)))
-	endpointX := max(2, w-7-runeLen(state.endpointLabel))
-	drawText(screen, endpointX, 1, colors.muted, "grpc "+state.endpointLabel)
-	drawText(screen, 2, 2, colors.muted, truncate("click ticker | wheel/+/- zoom | a/d pan | [/] timeframe | 0 reset | q quit", max(1, w-4)))
+	now := time.Now()
+	offset := bannerOffset(state, now)
+	if offset > 0 {
+		renderEventBanner(screen, colors, w, state, now)
+	}
 
-	tileY := 4
+	drawText(screen, 2, 0+offset, colors.headerAccent, "SSH ARENA")
+	drawText(screen, 13, 0+offset, colors.header, "market terminal")
+	drawText(screen, 2, 1+offset, colors.muted, truncate(state.playerLabel, max(1, w-4)))
+	endpointX := max(2, w-7-runeLen(state.endpointLabel))
+	drawText(screen, endpointX, 1+offset, colors.muted, "grpc "+state.endpointLabel)
+	drawText(screen, 2, 2+offset, colors.muted, truncate("click ticker/level | enter chat | b buy | s sell | r refresh | wheel zoom | a/d pan | [/] timeframe | q quit", max(1, w-4)))
+
+	tileY := 4 + offset
 	tileWidth := 22
 	tileHeight := 5
 	gap := 1
@@ -584,21 +926,25 @@ func render(screen tcell.Screen, colors palette, state *uiState) {
 		tilesBottom = state.tickerRects[len(state.tickerRects)-1].Y2
 	}
 	mainY := tilesBottom + 2
-	mainHeight := max(12, h-mainY-3)
+	chatHeight := min(11, max(8, h/4))
+	chatRect := tickerRect{X1: 1, Y1: max(mainY+8, h-chatHeight-2), X2: w - 2, Y2: h - 2}
+	mainHeight := max(10, chatRect.Y1-mainY-2)
 	chartWidth := int(float64(w) * 0.68)
 	chartWidth = min(chartWidth, w-2)
 	if chartWidth < 46 {
 		chartWidth = w - 2
 	}
-	chartRect := tickerRect{X1: 1, Y1: mainY, X2: min(w-2, chartWidth), Y2: min(h-2, mainY+mainHeight)}
+	chartRect := tickerRect{X1: 1, Y1: mainY, X2: min(w-2, chartWidth), Y2: min(chatRect.Y1-1, mainY+mainHeight)}
 	sidebarRect := tickerRect{X1: chartRect.X2 + 1, Y1: mainY, X2: w - 2, Y2: chartRect.Y2}
 
 	current := currentSymbol(state.cfg.Symbols, state.selected)
+
 	renderChartPanel(screen, colors, chartRect, current, state.ticks[current], state)
 	if sidebarRect.X2-sidebarRect.X1 >= 22 {
 		renderSidebar(screen, colors, sidebarRect, current, state.ticks[current], state)
 	}
 
+	renderChatPanel(screen, colors, chatRect, state)
 	statusY := h - 1
 	fillRect(screen, 0, statusY, w-1, statusY, colors.status)
 	drawText(screen, 1, statusY, colors.status, truncate("status: "+state.status, max(1, w-2)))
@@ -682,9 +1028,6 @@ func renderSidebar(screen tcell.Screen, colors palette, rect tickerRect, symbol 
 		{"1m", fmt.Sprintf("%+.2f%%", tick.Change1mPct), styleForChange(colors, tick.Change1mPct, colors.panelAltBG)},
 		{"5m", fmt.Sprintf("%+.2f%%", tick.Change5mPct), styleForChange(colors, tick.Change5mPct, colors.panelAltBG)},
 		{"15m", fmt.Sprintf("%+.2f%%", tick.Change15mPct), styleForChange(colors, tick.Change15mPct, colors.panelAltBG)},
-		{"vol 1m", fmt.Sprintf("%d", tick.Volume1m), colors.neutral},
-		{"vwap 5m", fmt.Sprintf("%.2f", tick.VWAP5m), colors.neutral},
-		{"volatility", fmt.Sprintf("%.4f", tick.Volatility5m), colors.neutral},
 		{"timeframe", timeframePresets[state.timeframe].Label, colors.neutral},
 		{"zoom", fmt.Sprintf("x%.2f", chartZoomFactor(state.chartZoom)), colors.neutral},
 	}
@@ -698,6 +1041,45 @@ func renderSidebar(screen tcell.Screen, colors palette, rect tickerRect, symbol 
 	}
 
 	y++
+	drawText(screen, rect.X1+2, y, colors.headerOn(colors.panelAltBG), "wallet")
+	y++
+	if state.hasPortfolio {
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "cash")
+		drawText(screen, rect.X1+14, y, colors.neutralOn(colors.panelAltBG), fmt.Sprintf("%.2f", moneyValue(state.portfolio.AvailableCash)))
+		y++
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "reserved")
+		drawText(screen, rect.X1+14, y, colors.neutralOn(colors.panelAltBG), fmt.Sprintf("%.2f", moneyValue(state.portfolio.ReservedCash)))
+		y++
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "shares")
+		drawText(screen, rect.X1+14, y, colors.neutralOn(colors.panelAltBG), fmt.Sprintf("%d", state.portfolio.AvailableStock[symbol]))
+		y++
+	} else {
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "loading portfolio...")
+		y++
+	}
+
+	y++
+	drawText(screen, rect.X1+2, y, colors.headerOn(colors.panelAltBG), "ticket")
+	y++
+	if state.ticket.Active {
+		drawTicketField(screen, rect.X1+2, y, colors, colors.panelAltBG, "side", strings.ToUpper(state.ticket.Side), state.ticket.Field == 0)
+		y++
+		drawTicketField(screen, rect.X1+2, y, colors, colors.panelAltBG, "type", strings.ToUpper(state.ticket.OrderType), state.ticket.Field == 0)
+		y++
+		if state.ticket.OrderType == "limit" {
+			drawTicketField(screen, rect.X1+2, y, colors, colors.panelAltBG, "price", state.ticket.Price, state.ticket.Field == 1)
+			y++
+		}
+		drawTicketField(screen, rect.X1+2, y, colors, colors.panelAltBG, "qty", state.ticket.Quantity, state.ticket.Field == 2)
+		y++
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "Tab switch | Enter send | Esc close | click book level")
+		y++
+	} else {
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "b buy | s sell | r refresh")
+		y++
+	}
+
+	y++
 	if y < rect.Y2-2 {
 		drawText(screen, rect.X1+2, y, colors.headerOn(colors.panelAltBG), "order book")
 		y += 2
@@ -706,10 +1088,11 @@ func renderSidebar(screen tcell.Screen, colors palette, rect tickerRect, symbol 
 		drawText(screen, rect.X1+2, y, colors.positiveOn(colors.panelAltBG), "bids")
 		y++
 	}
-	for _, bid := range tick.OrderBook.Bids {
-		if y >= rect.Y2-3 {
+	for idx, bid := range tick.OrderBook.Bids {
+		if idx >= 3 || y >= rect.Y2-3 {
 			break
 		}
+		state.orderbookRects = append(state.orderbookRects, orderbookRect{Side: "bid", Price: bid.Price, Quantity: bid.Qty, X1: rect.X1 + 2, Y1: y, X2: rect.X2 - 2, Y2: y})
 		drawText(screen, rect.X1+2, y, colors.positiveOn(colors.panelAltBG), fmt.Sprintf("%.2f", bid.Price))
 		drawText(screen, rect.X1+14, y, colors.neutralOn(colors.panelAltBG), fmt.Sprintf("%d", bid.Qty))
 		y++
@@ -719,16 +1102,31 @@ func renderSidebar(screen tcell.Screen, colors palette, rect tickerRect, symbol 
 		drawText(screen, rect.X1+2, y, colors.negativeOn(colors.panelAltBG), "asks")
 		y++
 	}
-	for _, ask := range tick.OrderBook.Asks {
-		if y >= rect.Y2-1 {
+	for idx, ask := range tick.OrderBook.Asks {
+		if idx >= 3 || y >= rect.Y2-1 {
 			break
 		}
+		state.orderbookRects = append(state.orderbookRects, orderbookRect{Side: "ask", Price: ask.Price, Quantity: ask.Qty, X1: rect.X1 + 2, Y1: y, X2: rect.X2 - 2, Y2: y})
 		drawText(screen, rect.X1+2, y, colors.negativeOn(colors.panelAltBG), fmt.Sprintf("%.2f", ask.Price))
 		drawText(screen, rect.X1+14, y, colors.neutralOn(colors.panelAltBG), fmt.Sprintf("%d", ask.Qty))
 		y++
 	}
 }
 
+func drawTicketField(screen tcell.Screen, x int, y int, colors palette, bg tcell.Color, label string, value string, selected bool) {
+	labelStyle := colors.mutedOn(bg)
+	valueStyle := colors.neutralOn(bg)
+	if selected {
+		labelStyle = colors.accentOn(bg)
+		valueStyle = colors.headerOn(bg)
+	}
+	drawText(screen, x, y, labelStyle, label)
+	drawText(screen, x+10, y, valueStyle, value)
+}
+
+func moneyValue(raw int64) float64 {
+	return math.Round((float64(raw)/100.0)*100) / 100
+}
 func renderChartPlot(screen tcell.Screen, colors palette, x1 int, y1 int, x2 int, y2 int, history []charting.HistoryPoint) {
 	if x2 <= x1 || y2 <= y1 || len(history) == 0 {
 		return
@@ -945,10 +1343,10 @@ func truncate(text string, width int) string {
 	if len(runes) <= width {
 		return text
 	}
-	if width <= 1 {
+	if width <= 3 {
 		return string(runes[:width])
 	}
-	return string(runes[:width-1]) + "…"
+	return string(runes[:width-3]) + "..."
 }
 
 func runeLen(text string) int {
@@ -999,9 +1397,6 @@ func normalizeSymbols(raw string, fallback []string) []string {
 		}
 		sort.Strings(out)
 	}
-	if len(out) == 0 {
-		out = []string{"TECH", "ENERGY", "FOOD", "CRYPTO", "DEFENSE", "PHARMA", "ENTERTAINMENT", "TRANSPORT"}
-	}
 	return out
 }
 
@@ -1010,6 +1405,24 @@ func mergeFallback(primary []string, secondary []string) []string {
 	out = append(out, primary...)
 	out = append(out, secondary...)
 	return out
+}
+
+func fetchMarketSymbols(cfg config) ([]string, error) {
+	response, err := executeActionJSON(cfg, "market.catalog", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Type    string   `json:"type"`
+		Symbols []string `json:"symbols"`
+	}
+	if err := json.Unmarshal([]byte(response), &payload); err != nil {
+		return nil, fmt.Errorf("decode market catalog: %w", err)
+	}
+	if payload.Type != "market.catalog" {
+		return nil, fmt.Errorf("unexpected market catalog payload %q", payload.Type)
+	}
+	return payload.Symbols, nil
 }
 
 func startChartStream(ctx context.Context, cfg config, ch chan<- any) {

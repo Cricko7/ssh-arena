@@ -7,7 +7,7 @@ import (
 )
 
 func TestBroadcastDeliversJSONToSubscribers(t *testing.T) {
-	service := NewService(10)
+	service := NewService(10, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

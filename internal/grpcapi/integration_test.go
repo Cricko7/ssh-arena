@@ -22,6 +22,28 @@ import (
 	"github.com/aeza/ssh-arena/internal/state"
 )
 
+func TestMarketCatalogViaGRPC(t *testing.T) {
+	ctx := context.Background()
+	conn, clients, _, cleanup := newIntegrationHarness(t)
+	defer cleanup()
+	defer conn.Close()
+
+	player := ensurePlayer(t, ctx, clients.accounts, "catalog-user")
+	resp := executeAction(t, ctx, clients.game, player.PlayerID, "catalog-1", "market.catalog", `{}`)
+
+	var payload struct {
+		Type    string   `json:"type"`
+		Count   int      `json:"count"`
+		Symbols []string `json:"symbols"`
+	}
+	mustDecodeJSON(t, resp.ResponseJSON, &payload)
+	if payload.Type != "market.catalog" {
+		t.Fatalf("expected market.catalog, got %q", payload.Type)
+	}
+	if payload.Count != 1 || len(payload.Symbols) != 1 || payload.Symbols[0] != "TECH" {
+		t.Fatalf("unexpected market catalog: %+v", payload)
+	}
+}
 func TestTradeHistoryAndLeaderboardViaGRPC(t *testing.T) {
 	ctx := context.Background()
 	conn, clients, stores, cleanup := newIntegrationHarness(t)
@@ -75,6 +97,99 @@ func TestTradeHistoryAndLeaderboardViaGRPC(t *testing.T) {
 				t.Fatalf("unexpected leaderboard stats for %s: %+v", entry.PlayerID, entry)
 			}
 		}
+	}
+}
+
+func TestDirectMessageDeliveredViaPrivateStream(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, clients, _, cleanup := newIntegrationHarness(t)
+	defer cleanup()
+	defer conn.Close()
+
+	alice := ensurePlayer(t, ctx, clients.accounts, "alice")
+	bob := ensurePlayer(t, ctx, clients.accounts, "bob")
+
+	stream, err := clients.game.GetMarketStream(ctx)
+	if err != nil {
+		t.Fatalf("open market stream: %v", err)
+	}
+	if err := stream.Send(&gamev1.MarketStreamRequest{PlayerID: bob.PlayerID, Symbols: []string{"TECH"}, IncludeChat: true}); err != nil {
+		t.Fatalf("subscribe market stream: %v", err)
+	}
+
+	executeAction(t, ctx, clients.game, alice.PlayerID, "dm-1", "chat.send", `{"to":"bob","body":"psst"}`)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("recv market stream: %v", err)
+		}
+		if msg.Topic != "private" {
+			continue
+		}
+		var payload chat.Message
+		mustDecodeJSON(t, msg.JSON, &payload)
+		if payload.Type != "chat.direct" {
+			continue
+		}
+		if payload.Body != "psst" || payload.Username != "alice" || payload.RecipientUsername != "bob" {
+			t.Fatalf("unexpected direct payload: %+v", payload)
+		}
+		return
+	}
+	t.Fatal("did not receive direct message via private stream")
+}
+
+func TestOfflineChatHistoryDeliveredOnConnect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, clients, _, cleanup := newIntegrationHarness(t)
+	defer cleanup()
+	defer conn.Close()
+
+	alice := ensurePlayer(t, ctx, clients.accounts, "alice")
+	bob := ensurePlayer(t, ctx, clients.accounts, "bob")
+
+	executeAction(t, ctx, clients.game, alice.PlayerID, "global-1", "chat.send", `{"body":"hello lobby"}`)
+	executeAction(t, ctx, clients.game, alice.PlayerID, "dm-offline-1", "chat.send", fmt.Sprintf(`{"to":"%s","body":"offline ping"}`, bob.PlayerID))
+
+	stream, err := clients.game.GetMarketStream(ctx)
+	if err != nil {
+		t.Fatalf("open market stream: %v", err)
+	}
+	if err := stream.Send(&gamev1.MarketStreamRequest{PlayerID: bob.PlayerID, Symbols: []string{"TECH"}, IncludeChat: true}); err != nil {
+		t.Fatalf("subscribe market stream: %v", err)
+	}
+
+	var sawGlobal bool
+	var sawDirect bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && (!sawGlobal || !sawDirect) {
+		msg, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("recv market stream: %v", err)
+		}
+		switch msg.Topic {
+		case "chat":
+			var payload chat.Message
+			mustDecodeJSON(t, msg.JSON, &payload)
+			if payload.Body == "hello lobby" && payload.Username == "alice" {
+				sawGlobal = true
+			}
+		case "private":
+			var payload chat.Message
+			mustDecodeJSON(t, msg.JSON, &payload)
+			if payload.Body == "offline ping" && payload.Username == "alice" && payload.RecipientID == bob.PlayerID {
+				sawDirect = true
+			}
+		}
+	}
+	if !sawGlobal || !sawDirect {
+		t.Fatalf("expected offline chat backlog, sawGlobal=%t sawDirect=%t", sawGlobal, sawDirect)
 	}
 }
 
@@ -135,6 +250,7 @@ type integrationStores struct {
 	players     *state.PlayerStore
 	tradeStore  *state.TradeStore
 	performance *state.PerformanceStore
+	chatStore   *state.ChatStore
 }
 
 type integrationClients struct {
@@ -159,12 +275,17 @@ func newIntegrationHarness(t *testing.T) (*grpc.ClientConn, integrationClients, 
 	if err != nil {
 		t.Fatalf("load performance store: %v", err)
 	}
+	chatStore, err := state.LoadChatStore(filepath.Join(baseDir, "chat.json"), 1000)
+	if err != nil {
+		t.Fatalf("load chat store: %v", err)
+	}
 
 	allocator := roles.NewAllocatorWithSeed(roles.Config{
 		Buyer:  roles.Profile{Cash: 100_000, BaseHoldings: map[string]int64{"*": 5}, VariancePct: 0},
 		Holder: roles.Profile{Cash: 100_000, BaseHoldings: map[string]int64{"*": 5}, VariancePct: 0},
 		Whale:  roles.Profile{Cash: 100_000, BaseHoldings: map[string]int64{"*": 5}, VariancePct: 0},
 	}, 1)
+	chatService := chat.NewService(32, chatStore)
 	market := exchange.NewService([]exchange.Ticker{{
 		Symbol:         "TECH",
 		Name:           "Tech",
@@ -173,8 +294,8 @@ func newIntegrationHarness(t *testing.T) (*grpc.ClientConn, integrationClients, 
 		TickSize:       5,
 		LiquidityUnits: 10000,
 		WhaleThreshold: 500,
-	}}, chat.NewService(32), nil)
-	engine := gameplay.NewEngine(players, trades, performance, allocator, market, chat.NewService(32), nil)
+	}}, chatService, nil)
+	engine := gameplay.NewEngine(players, trades, performance, chatStore, allocator, market, chatService, nil)
 	api := New(engine)
 
 	listener := bufconn.Listen(1024 * 1024)
@@ -210,7 +331,7 @@ func newIntegrationHarness(t *testing.T) (*grpc.ClientConn, integrationClients, 
 	return conn, integrationClients{
 		accounts: gamev1.NewAccountServiceClient(conn),
 		game:     gamev1.NewGameServiceClient(conn),
-	}, integrationStores{players: players, tradeStore: trades, performance: performance}, cleanup
+	}, integrationStores{players: players, tradeStore: trades, performance: performance, chatStore: chatStore}, cleanup
 }
 
 func ensurePlayer(t *testing.T, ctx context.Context, client gamev1.AccountServiceClient, username string) *gamev1.PlayerBootstrapResponse {

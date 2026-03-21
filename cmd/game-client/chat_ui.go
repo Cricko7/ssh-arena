@@ -1,0 +1,322 @@
+package main
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/gdamore/tcell/v2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding"
+
+	gamev1 "github.com/aeza/ssh-arena/gen/game/v1"
+	"github.com/aeza/ssh-arena/internal/grpcjson"
+)
+
+type chatEntry struct {
+	Type              string    `json:"type"`
+	Channel           string    `json:"channel"`
+	PlayerID          string    `json:"player_id"`
+	Username          string    `json:"username"`
+	Role              string    `json:"role"`
+	Body              string    `json:"body"`
+	RecipientID       string    `json:"recipient_id,omitempty"`
+	RecipientUsername string    `json:"recipient_username,omitempty"`
+	SentAt            time.Time `json:"sent_at"`
+	Topic             string    `json:"-"`
+}
+
+type chatEntryMsg struct {
+	entry chatEntry
+}
+
+type chatNameRect struct {
+	PlayerID string
+	Username string
+	X1       int
+	Y1       int
+	X2       int
+	Y2       int
+}
+
+type streamPortfolioMsg struct {
+	snapshot portfolioSnapshot
+}
+
+func startMarketStream(ctx context.Context, cfg config, ch chan<- any) {
+	grpcjson.Register()
+	codec := encoding.GetCodec("json")
+	if codec == nil {
+		ch <- errMsg{err: fmt.Errorf("json gRPC codec is not registered")}
+		return
+	}
+	conn, err := grpc.DialContext(ctx, cfg.GRPCAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(codec)),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		ch <- errMsg{err: fmt.Errorf("grpc dial market stream: %w", err)}
+		return
+	}
+	defer conn.Close()
+
+	api := gamev1.NewGameServiceClient(conn)
+	stream, err := api.GetMarketStream(ctx)
+	if err != nil {
+		ch <- errMsg{err: fmt.Errorf("subscribe market stream: %w", err)}
+		return
+	}
+	if err := stream.Send(&gamev1.MarketStreamRequest{
+		PlayerID:         cfg.PlayerID,
+		Symbols:          cfg.Symbols,
+		IncludePortfolio: true,
+		IncludeChat:      true,
+		IncludeTrades:    true,
+		IncludeOrderbook: true,
+	}); err != nil {
+		ch <- errMsg{err: fmt.Errorf("send market stream subscription: %w", err)}
+		return
+	}
+
+	for {
+		env, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF || ctx.Err() != nil {
+				return
+			}
+			ch <- errMsg{err: fmt.Errorf("recv market stream: %w", err)}
+			return
+		}
+		switch env.Topic {
+		case "portfolio":
+			var snapshot portfolioSnapshot
+			if err := json.Unmarshal([]byte(env.JSON), &snapshot); err == nil && snapshot.Type == "portfolio.snapshot" {
+				ch <- streamPortfolioMsg{snapshot: snapshot}
+			}
+		case "market":
+			if event, ok := decodeMarketEvent(env.JSON); ok {
+				ch <- marketEventMsg{event: event}
+			}
+		case "chat", "private":
+			entry, ok := decodeChatEntry(env.JSON, env.Topic)
+			if ok {
+				ch <- chatEntryMsg{entry: entry}
+			}
+		}
+	}
+}
+
+func decodeChatEntry(raw string, topic string) (chatEntry, bool) {
+	var entry chatEntry
+	if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+		return chatEntry{}, false
+	}
+	if strings.TrimSpace(entry.Body) == "" {
+		return chatEntry{}, false
+	}
+	entry.Topic = topic
+	return entry, true
+}
+
+func appendChatEntry(state *uiState, entry chatEntry) {
+	state.chatLines = append(state.chatLines, entry)
+	if len(state.chatLines) > 500 {
+		state.chatLines = state.chatLines[len(state.chatLines)-500:]
+	}
+	if state.chatScroll > 0 {
+		state.chatScroll++
+	}
+}
+
+func handleChatKeyEvent(ev *tcell.EventKey, state *uiState, cfg config, events chan<- any) bool {
+	switch ev.Key() {
+	case tcell.KeyEscape:
+		state.chatFocus = false
+		state.status = "chat input closed"
+		return true
+	case tcell.KeyEnter:
+		submitChatAsync(cfg, state, events)
+		return true
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		runes := []rune(state.chatInput)
+		if len(runes) > 0 {
+			state.chatInput = string(runes[:len(runes)-1])
+		}
+		return true
+	case tcell.KeyTab:
+		state.chatFocus = false
+		state.status = "chat input closed"
+		return true
+	case tcell.KeyPgUp:
+		scrollChat(state, 5)
+		return true
+	case tcell.KeyPgDn:
+		scrollChat(state, -5)
+		return true
+	case tcell.KeyUp:
+		scrollChat(state, 1)
+		return true
+	case tcell.KeyDown:
+		scrollChat(state, -1)
+		return true
+	case tcell.KeyHome:
+		state.chatScroll = 999999
+		return true
+	case tcell.KeyEnd:
+		state.chatScroll = 0
+		return true
+	case tcell.KeyRune:
+		r := ev.Rune()
+		if r >= 32 {
+			state.chatInput += string(r)
+		}
+		return true
+	}
+	return true
+}
+
+func scrollChat(state *uiState, delta int) {
+	state.chatScroll += delta
+	if state.chatScroll < 0 {
+		state.chatScroll = 0
+	}
+}
+
+func submitChatAsync(cfg config, state *uiState, events chan<- any) {
+	payload, label, err := buildChatPayload(state.chatInput)
+	if err != nil {
+		events <- errMsg{err: err}
+		return
+	}
+	state.chatInput = ""
+	state.status = label
+	go executeActionAsync(cfg, "chat.send", payload, events)
+}
+
+func buildChatPayload(input string) (map[string]any, string, error) {
+	text := strings.TrimSpace(input)
+	if text == "" {
+		return nil, "", fmt.Errorf("message is empty")
+	}
+	parts := strings.Fields(text)
+	if len(parts) >= 3 && (parts[0] == "/w" || parts[0] == "/dm" || parts[0] == "/msg") {
+		body := strings.TrimSpace(strings.Join(parts[2:], " "))
+		if body == "" {
+			return nil, "", fmt.Errorf("direct message body is empty")
+		}
+		return map[string]any{"to": parts[1], "body": body}, fmt.Sprintf("sending DM to %s...", parts[1]), nil
+	}
+	return map[string]any{"body": text}, "sending chat message...", nil
+}
+
+func renderChatPanel(screen tcell.Screen, colors palette, rect tickerRect, state *uiState) {
+	state.chatRect = rect
+	state.chatNameRects = state.chatNameRects[:0]
+	drawRoundedBox(screen, rect.X1, rect.Y1, rect.X2, rect.Y2, colors.panel, colors.border)
+	headerStyle := colors.accentOn(colors.panelBG)
+	if state.chatFocus {
+		headerStyle = colors.headerOn(colors.panelBG)
+	}
+	drawText(screen, rect.X1+2, rect.Y1, headerStyle, "chat")
+	drawText(screen, rect.X1+8, rect.Y1, colors.mutedOn(colors.panelBG), "click name -> copy id | /dm <id> text")
+
+	innerX1 := rect.X1 + 2
+	innerX2 := rect.X2 - 2
+	inputY := rect.Y2 - 1
+	availableLines := max(1, inputY-rect.Y1-2)
+	maxStart := max(0, len(state.chatLines)-availableLines)
+	if state.chatScroll > maxStart {
+		state.chatScroll = maxStart
+	}
+	start := max(0, len(state.chatLines)-availableLines-state.chatScroll)
+	y := rect.Y1 + 2
+	for _, entry := range state.chatLines[start:] {
+		if y >= inputY {
+			break
+		}
+		tag, name, nameID, style := chatDisplayParts(entry, state.cfg.PlayerID, state.cfg.Username, colors)
+		x := innerX1
+		if tag != "" {
+			drawText(screen, x, y, colors.mutedOn(colors.panelBG), tag+" ")
+			x += runeLen(tag) + 1
+		}
+		if name != "" {
+			drawText(screen, x, y, style, name)
+			state.chatNameRects = append(state.chatNameRects, chatNameRect{
+				PlayerID: nameID,
+				Username: name,
+				X1:       x,
+				Y1:       y,
+				X2:       x + runeLen(name) - 1,
+				Y2:       y,
+			})
+			x += runeLen(name)
+		}
+		bodyPrefix := ": "
+		if name == "" {
+			bodyPrefix = ""
+		}
+		body := truncate(bodyPrefix+entry.Body, max(0, innerX2-x+1))
+		drawText(screen, x, y, colors.neutralOn(colors.panelBG), body)
+		y++
+	}
+
+	prompt := "> " + state.chatInput
+	inputStyle := colors.mutedOn(colors.panelBG)
+	if state.chatFocus {
+		inputStyle = colors.headerOn(colors.panelBG)
+	}
+	drawText(screen, innerX1, inputY, inputStyle, truncate(prompt, max(1, innerX2-innerX1+1)))
+}
+
+func chatDisplayParts(entry chatEntry, selfID string, selfUsername string, colors palette) (string, string, string, tcell.Style) {
+	switch {
+	case entry.Type == "chat.direct" && entry.PlayerID == selfID:
+		name := entry.RecipientUsername
+		if name == "" {
+			name = entry.RecipientID
+		}
+		return "[dm]", name, entry.RecipientID, colors.accentOn(colors.panelBG)
+	case entry.Type == "chat.direct":
+		name := entry.Username
+		if name == "" {
+			name = entry.PlayerID
+		}
+		return "[dm]", name, entry.PlayerID, colors.accentOn(colors.panelBG)
+	case entry.Type == "system.event":
+		return "", "system", "", colors.mutedOn(colors.panelBG)
+	default:
+		name := entry.Username
+		if name == "" {
+			name = entry.PlayerID
+		}
+		style := colors.neutralOn(colors.panelBG)
+		if entry.PlayerID == selfID || name == selfUsername {
+			style = colors.positiveOn(colors.panelBG)
+		}
+		return "", name, entry.PlayerID, style
+	}
+}
+
+func copyPlayerIDIntoChat(state *uiState, rect chatNameRect) {
+	state.chatInput = "/dm " + rect.PlayerID + " "
+	state.chatFocus = true
+	if err := copyToClipboardBestEffort(rect.PlayerID); err != nil {
+		state.status = fmt.Sprintf("prepared DM to %s (%s)", rect.Username, rect.PlayerID)
+		return
+	}
+	state.status = fmt.Sprintf("copied %s id and prepared DM", rect.Username)
+}
+
+func copyToClipboardBestEffort(value string) error {
+	encoded := base64.StdEncoding.EncodeToString([]byte(value))
+	_, err := fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\x07", encoded)
+	return err
+}

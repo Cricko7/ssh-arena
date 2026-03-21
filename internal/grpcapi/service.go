@@ -116,11 +116,19 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 				continue
 			}
 			playerID = req.PlayerID
+			includePortfolio = req.IncludePortfolio
+			includeChat = req.IncludeChat
+			if includeChat {
+				if err := s.sendInitialChatState(stream, playerID); err != nil {
+					return err
+				}
+				if chatFeed == nil {
+					chatFeed = s.engine.ChatFeed(ctx)
+				}
+			}
 			if playerID != "" && privateFeed == nil {
 				privateFeed = s.engine.SubscribePrivate(ctx, playerID)
 			}
-			includePortfolio = req.IncludePortfolio
-			includeChat = req.IncludeChat
 			symbols = make(map[string]struct{}, len(req.Symbols))
 			for _, symbol := range req.Symbols {
 				symbols[symbol] = struct{}{}
@@ -215,7 +223,7 @@ func (s *Service) SendChat(ctx context.Context, req *gamev1.ChatRequest) (*gamev
 	if err := json.Unmarshal([]byte(req.JSON), &payload); err != nil {
 		return nil, err
 	}
-	messageJSON, err := s.engine.SendChat(ctx, req.PlayerID, payload.Body)
+	messageJSON, err := s.engine.SendChat(ctx, req.PlayerID, payload.Body, "")
 	if err != nil {
 		return nil, err
 	}
@@ -259,6 +267,29 @@ func (s *Service) sendInitialMarketState(stream gamev1.GameService_GetMarketStre
 			if err := stream.Send(s.envelope("portfolio", payload)); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) sendInitialChatState(stream gamev1.GameService_GetMarketStreamServer, playerID string) error {
+	for _, payload := range s.engine.ChatHistory() {
+		if payload == "" {
+			continue
+		}
+		if err := stream.Send(s.envelope("chat", payload)); err != nil {
+			return err
+		}
+	}
+	if playerID == "" {
+		return nil
+	}
+	for _, payload := range s.engine.PrivateHistory(playerID) {
+		if payload == "" {
+			continue
+		}
+		if err := stream.Send(s.envelope("private", payload)); err != nil {
+			return err
 		}
 	}
 	return nil

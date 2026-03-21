@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/aeza/ssh-arena/internal/intel"
+	"github.com/aeza/ssh-arena/internal/state"
 )
 
 func (e *Engine) SetIntelEngine(engine *intel.Engine) {
@@ -39,9 +40,46 @@ func (e *Engine) SubscribePrivate(ctx context.Context, playerID string) <-chan s
 	return ch
 }
 
+func (e *Engine) PrivateHistory(playerID string) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.privateHistorySnapshot(playerID)...)
+}
+
+func (e *Engine) privateHistorySnapshot(playerID string) []string {
+	var history []string
+	if e.chatStore != nil {
+		for _, item := range e.chatStore.Query(state.ChatQuery{PlayerID: playerID, Limit: e.privateHistoryLimit}) {
+			if item.Channel == "global" {
+				continue
+			}
+			raw, err := json.Marshal(item)
+			if err != nil {
+				continue
+			}
+			history = append(history, string(raw))
+		}
+	}
+	for _, item := range e.privateHistory[playerID] {
+		history = append(history, item)
+	}
+	if len(history) > e.privateHistoryLimit {
+		history = history[len(history)-e.privateHistoryLimit:]
+	}
+	return history
+}
+
 func (e *Engine) NotifyPlayer(playerID string, payload string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.notifyPlayerLocked(playerID, payload)
+}
+
+func (e *Engine) notifyPlayerLocked(playerID string, payload string) {
+	e.privateHistory[playerID] = append(e.privateHistory[playerID], payload)
+	if len(e.privateHistory[playerID]) > e.privateHistoryLimit {
+		e.privateHistory[playerID] = e.privateHistory[playerID][len(e.privateHistory[playerID])-e.privateHistoryLimit:]
+	}
 	for _, ch := range e.privateSubs[playerID] {
 		select {
 		case ch <- payload:

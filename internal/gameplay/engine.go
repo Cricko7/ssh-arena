@@ -21,19 +21,22 @@ import (
 )
 
 type Engine struct {
-	mu            sync.Mutex
-	players       *state.PlayerStore
-	tradeHistory  *state.TradeStore
-	performance   *state.PerformanceStore
-	allocator     *roles.Allocator
-	market        *exchange.Service
-	chat          *chat.Service
-	charts        *charting.Engine
-	intel         *intel.Engine
-	symbols       []string
-	openOrders    map[string]*openOrder
-	privateSubs   map[string]map[int]chan string
-	nextPrivateID int
+	mu                  sync.Mutex
+	players             *state.PlayerStore
+	tradeHistory        *state.TradeStore
+	performance         *state.PerformanceStore
+	chatStore           *state.ChatStore
+	allocator           *roles.Allocator
+	market              *exchange.Service
+	chat                *chat.Service
+	charts              *charting.Engine
+	intel               *intel.Engine
+	symbols             []string
+	openOrders          map[string]*openOrder
+	privateSubs         map[string]map[int]chan string
+	privateHistory      map[string][]string
+	privateHistoryLimit int
+	nextPrivateID       int
 }
 
 type openOrder struct {
@@ -91,22 +94,26 @@ type cancelOrderPayload struct {
 
 type chatPayload struct {
 	Body string `json:"body"`
+	To   string `json:"to,omitempty"`
 }
 
-func NewEngine(players *state.PlayerStore, tradeHistory *state.TradeStore, performance *state.PerformanceStore, allocator *roles.Allocator, market *exchange.Service, chatService *chat.Service, charts *charting.Engine) *Engine {
+func NewEngine(players *state.PlayerStore, tradeHistory *state.TradeStore, performance *state.PerformanceStore, chatStore *state.ChatStore, allocator *roles.Allocator, market *exchange.Service, chatService *chat.Service, charts *charting.Engine) *Engine {
 	symbols := market.ListTickers()
 	sort.Strings(symbols)
 	return &Engine{
-		players:      players,
-		tradeHistory: tradeHistory,
-		performance:  performance,
-		allocator:    allocator,
-		market:       market,
-		chat:         chatService,
-		charts:       charts,
-		symbols:      symbols,
-		openOrders:   make(map[string]*openOrder),
-		privateSubs:  make(map[string]map[int]chan string),
+		players:             players,
+		tradeHistory:        tradeHistory,
+		performance:         performance,
+		chatStore:           chatStore,
+		allocator:           allocator,
+		market:              market,
+		chat:                chatService,
+		charts:              charts,
+		symbols:             symbols,
+		openOrders:          make(map[string]*openOrder),
+		privateSubs:         make(map[string]map[int]chan string),
+		privateHistory:      make(map[string][]string),
+		privateHistoryLimit: 64,
 	}
 }
 
@@ -173,6 +180,8 @@ func (e *Engine) ExecuteAction(ctx context.Context, req ExecuteActionRequest) (s
 		return e.handleSendChat(ctx, req)
 	case "market.snapshot":
 		return e.handleMarketSnapshot(req)
+	case "market.catalog", "market.list":
+		return e.handleMarketCatalog(), nil
 	case "trade.history", "trades.history":
 		return e.handleTradeHistory(req)
 	case "stats.leaderboard", "leaderboard":
@@ -196,7 +205,14 @@ func (e *Engine) ChatFeed(ctx context.Context) <-chan string {
 		close(ch)
 		return ch
 	}
-	return e.chat.Subscribe(ctx)
+	return e.chat.SubscribeLive(ctx)
+}
+
+func (e *Engine) ChatHistory() []string {
+	if e.chat == nil {
+		return nil
+	}
+	return e.chat.History()
 }
 
 func (e *Engine) SubscribeChart(ctx context.Context, playerID string, ticker string, historyLimit int, depth int) (<-chan string, error) {
@@ -211,23 +227,58 @@ func (e *Engine) SubscribeChart(ctx context.Context, playerID string, ticker str
 	})
 }
 
-func (e *Engine) SendChat(ctx context.Context, playerID string, body string) (string, error) {
+func (e *Engine) SendChat(ctx context.Context, playerID string, body string, to string) (string, error) {
 	player, err := e.requirePlayer(playerID)
 	if err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(body) == "" {
+	body = strings.TrimSpace(body)
+	if body == "" {
 		return "", fmt.Errorf("chat body is required")
 	}
-	return e.chat.Broadcast(ctx, chat.Message{
-		Type:     "chat.message",
-		Channel:  "global",
-		PlayerID: player.PlayerID,
-		Username: player.Username,
-		Role:     player.Role,
-		Body:     body,
-		SentAt:   time.Now().UTC(),
-	})
+	to = strings.TrimSpace(to)
+	if to == "" {
+		return e.chat.Broadcast(ctx, chat.Message{
+			Type:     "chat.message",
+			Channel:  "global",
+			PlayerID: player.PlayerID,
+			Username: player.Username,
+			Role:     player.Role,
+			Body:     body,
+			SentAt:   time.Now().UTC(),
+		})
+	}
+
+	recipient, err := e.resolvePlayerRef(to)
+	if err != nil {
+		return "", err
+	}
+	message := chat.Message{
+		Type:              "chat.direct",
+		Channel:           "direct",
+		PlayerID:          player.PlayerID,
+		Username:          player.Username,
+		Role:              player.Role,
+		Body:              body,
+		RecipientID:       recipient.PlayerID,
+		RecipientUsername: recipient.Username,
+		SentAt:            time.Now().UTC(),
+	}
+	if e.chatStore != nil {
+		if err := e.chatStore.Append(state.ChatMessage(message)); err != nil {
+			return "", err
+		}
+	}
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return "", fmt.Errorf("marshal direct chat message: %w", err)
+	}
+	payload := string(raw)
+	if recipient.PlayerID != player.PlayerID {
+		e.notifyPlayerLocked(recipient.PlayerID, payload)
+	}
+	e.notifyPlayerLocked(player.PlayerID, payload)
+	return payload, nil
 }
 
 func (e *Engine) handlePlaceOrder(ctx context.Context, req ExecuteActionRequest) (string, error) {
@@ -356,7 +407,7 @@ func (e *Engine) handleSendChat(ctx context.Context, req ExecuteActionRequest) (
 	if err := json.Unmarshal(req.Payload, &payload); err != nil {
 		return "", fmt.Errorf("decode chat payload: %w", err)
 	}
-	messageJSON, err := e.SendChat(ctx, req.PlayerID, payload.Body)
+	messageJSON, err := e.SendChat(ctx, req.PlayerID, payload.Body, payload.To)
 	if err != nil {
 		return "", err
 	}
@@ -384,6 +435,14 @@ func (e *Engine) handleMarketSnapshot(req ExecuteActionRequest) (string, error) 
 		return "", err
 	}
 	return jsonPayload, nil
+}
+
+func (e *Engine) handleMarketCatalog() string {
+	return marshalJSON(map[string]any{
+		"type":    "market.catalog",
+		"count":   len(e.symbols),
+		"symbols": append([]string(nil), e.symbols...),
+	})
 }
 
 func (e *Engine) reserveForIncoming(player *state.Player, symbol string, side orderbook.Side, kind orderbook.OrderType, price int64, qty int64) (int64, int64, error) {
@@ -591,6 +650,19 @@ func (e *Engine) requirePlayer(playerID string) (state.Player, error) {
 		return state.Player{}, fmt.Errorf("player %q not found", playerID)
 	}
 	return player, nil
+}
+
+func (e *Engine) resolvePlayerRef(ref string) (state.Player, error) {
+	if ref == "" {
+		return state.Player{}, fmt.Errorf("recipient is required")
+	}
+	if player, ok := e.players.GetByPlayerID(ref); ok {
+		return player, nil
+	}
+	if player, ok := e.players.Get(ref); ok {
+		return player, nil
+	}
+	return state.Player{}, fmt.Errorf("player %q not found", ref)
 }
 
 func (e *Engine) getTouchedPlayer(playerID string, touched map[string]*state.Player) (*state.Player, error) {

@@ -14,6 +14,7 @@ type RuntimeConfig struct {
 	PlayerStatePath          string `yaml:"player_state_path"`
 	TradeHistoryPath         string `yaml:"trade_history_path"`
 	PerformanceHistoryPath   string `yaml:"performance_history_path"`
+	ChatHistoryPath          string `yaml:"chat_history_path"`
 	RandomEventIntervalSecs  int    `yaml:"random_event_interval_seconds"`
 	RandomEventsPath         string `yaml:"random_events_path"`
 	IntelEventIntervalSecs   int    `yaml:"intel_event_interval_seconds"`
@@ -28,6 +29,7 @@ func DefaultRuntimeConfig() RuntimeConfig {
 		PlayerStatePath:          "data/players.json",
 		TradeHistoryPath:         "data/trades.json",
 		PerformanceHistoryPath:   "data/performance.json",
+		ChatHistoryPath:          "data/chat.json",
 		RandomEventIntervalSecs:  15,
 		RandomEventsPath:         "events/random_events.json",
 		IntelEventIntervalSecs:   12,
@@ -64,6 +66,9 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 	}
 	if cfg.PerformanceHistoryPath == "" {
 		cfg.PerformanceHistoryPath = "data/performance.json"
+	}
+	if cfg.ChatHistoryPath == "" {
+		cfg.ChatHistoryPath = "data/chat.json"
 	}
 	if cfg.RandomEventIntervalSecs <= 0 {
 		cfg.RandomEventIntervalSecs = 15

@@ -9,3 +9,4 @@ random_events_path: events/random_events.json
 intel_event_interval_seconds: 12
 intel_events_path: events/intel_feeds.json
 
+chat_history_path: data/chat.json
