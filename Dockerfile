@@ -1,4 +1,4 @@
-FROM golang:1.23-alpine AS build
+FROM golang:1.24-alpine AS build
 WORKDIR /src
 
 RUN apk add --no-cache git ca-certificates
@@ -31,3 +31,4 @@ USER appuser
 EXPOSE 9090 2222
 
 CMD ["/app/bin/grpc-game"]
+

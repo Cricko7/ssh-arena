@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	gossh "github.com/gliderlabs/ssh"
@@ -44,7 +44,7 @@ func main() {
 
 	client, conn, err := newBootstrapClient(grpcTarget)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	defer conn.Close()
 
@@ -61,9 +61,9 @@ func main() {
 		server.SetOption(gossh.HostKeyFile(hostSigner))
 	}
 
-	log.Printf("ssh bootstrap gateway listening on %s, forwarding to %s, advertising %s", addr, grpcTarget, grpcPublicAddr)
+	fmt.Printf("ssh bootstrap gateway listening on %s, forwarding to %s, advertising %s\n", addr, grpcTarget, grpcPublicAddr)
 	if err := server.ListenAndServe(); err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 }
 
@@ -87,12 +87,31 @@ func sessionHandler(client *bootstrapClient, grpcPublicAddr string) gossh.Handle
 			return
 		}
 
+		ps1URL := envOr("CLIENT_INSTALL_PS1_URL", "https://raw.githubusercontent.com/Cricko7/ssh-arena/main/scripts/install-client.ps1")
+		shURL := envOr("CLIENT_INSTALL_SH_URL", "https://raw.githubusercontent.com/Cricko7/ssh-arena/main/scripts/install-client.sh")
+		installMessage := map[string]any{
+			"type":          "ssh.client.install",
+			"message":       "If the local client is missing, install it once. The client will remember your player_id and server settings for later launches.",
+			"player_id":     resp.PlayerID,
+			"grpc_endpoint": grpcPublicAddr,
+			"powershell":    fmt.Sprintf("irm %s | iex", ps1URL),
+			"shell":         fmt.Sprintf("curl -fsSL %s | sh", shURL),
+			"launch":        "game-client",
+		}
+		installJSON := marshalJSON(installMessage)
+
 		_, _ = fmt.Fprintf(session, "welcome, %s\r\n", session.User())
 		_, _ = fmt.Fprintf(session, "grpc_endpoint=%s\r\n", grpcPublicAddr)
 		_, _ = fmt.Fprintln(session, resp.BootstrapJSON)
-		_, _ = fmt.Fprintln(session, `{"type":"ssh.bootstrap.complete","message":"Use gRPC for gameplay commands, chat, charts and market streams."}`)
+		_, _ = fmt.Fprintln(session, installJSON)
+		_, _ = fmt.Fprintln(session, `{"type":"ssh.bootstrap.complete","message":"Use the local game-client for charts, gameplay, chat and market streams. It will reuse the saved player_id on the next launch."}`)
 		_, _ = fmt.Fprintln(session, "disconnecting from SSH bootstrap gateway")
 	}
+}
+
+func marshalJSON(value any) string {
+	raw, _ := grpcjson.Codec{}.Marshal(value)
+	return string(raw)
 }
 
 func passwordHandler(_ gossh.Context, password string) bool {
@@ -112,7 +131,7 @@ func remoteIP(addr net.Addr) string {
 }
 
 func envOr(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
+	if value := os.Getenv(key); strings.TrimSpace(value) != "" {
 		return value
 	}
 	return fallback

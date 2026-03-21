@@ -23,7 +23,7 @@ type RuntimeConfig struct {
 func DefaultRuntimeConfig() RuntimeConfig {
 	return RuntimeConfig{
 		ChartTickIntervalSeconds: 3,
-		ChartHistoryPoints:       240,
+		ChartHistoryPoints:       2400,
 		ChartOrderbookDepth:      10,
 		PlayerStatePath:          "data/players.json",
 		TradeHistoryPath:         "data/trades.json",
@@ -51,7 +51,7 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 		cfg.ChartTickIntervalSeconds = 3
 	}
 	if cfg.ChartHistoryPoints <= 0 {
-		cfg.ChartHistoryPoints = 240
+		cfg.ChartHistoryPoints = 2400
 	}
 	if cfg.ChartOrderbookDepth <= 0 {
 		cfg.ChartOrderbookDepth = 10
