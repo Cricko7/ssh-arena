@@ -105,7 +105,8 @@ func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceO
 		return PlaceOrderOutput{}, err
 	}
 
-	s.recentTrades[input.Symbol] = append(result.Trades, s.recentTrades[input.Symbol]...)
+	executedTrades := append([]orderbook.Trade(nil), result.Trades...)
+	s.recentTrades[input.Symbol] = append(executedTrades, s.recentTrades[input.Symbol]...)
 	if len(s.recentTrades[input.Symbol]) > 500 {
 		s.recentTrades[input.Symbol] = s.recentTrades[input.Symbol][:500]
 	}
@@ -122,6 +123,18 @@ func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceO
 	}
 
 	s.publishLocked(jsonPayload)
+	for _, trade := range executedTrades {
+		tradeJSON, marshalErr := MarshalEnvelope("market.trade", trade)
+		if marshalErr != nil {
+			return PlaceOrderOutput{}, marshalErr
+		}
+		s.publishLocked(tradeJSON)
+		if s.cache != nil {
+			if err := s.cache.Publish(ctx, "arena.trades."+input.Symbol, tradeJSON); err != nil {
+				return PlaceOrderOutput{}, err
+			}
+		}
+	}
 	if s.cache != nil {
 		if err := s.cache.PutSnapshot(ctx, input.Symbol, jsonPayload); err != nil {
 			return PlaceOrderOutput{}, err
@@ -135,7 +148,7 @@ func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceO
 		Order:      result.Order,
 		OrderBook:  result.Snapshot,
 		Price:      price,
-		Trades:     s.recentTrades[input.Symbol],
+		Trades:     executedTrades,
 		Resting:    result.Resting,
 		Removed:    result.Removed,
 		JSON:       jsonPayload,
@@ -316,4 +329,19 @@ func (s *Service) publishLocked(payload string) {
 		default:
 		}
 	}
+}
+
+func (s *Service) PriceMap() (map[string]PricePoint, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prices := make(map[string]PricePoint, len(s.tickers))
+	for symbol := range s.tickers {
+		price, err := s.priceEngine.Current(symbol)
+		if err != nil {
+			return nil, err
+		}
+		prices[symbol] = price
+	}
+	return prices, nil
 }

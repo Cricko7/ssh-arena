@@ -2,8 +2,9 @@
 chart_history_points: 240
 chart_orderbook_depth: 10
 player_state_path: data/players.json
+trade_history_path: data/trades.json
+performance_history_path: data/performance.json
 random_event_interval_seconds: 15
 random_events_path: events/random_events.json
 intel_event_interval_seconds: 12
 intel_events_path: events/intel_feeds.json
-

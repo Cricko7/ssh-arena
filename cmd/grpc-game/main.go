@@ -56,6 +56,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	tradeStore, err := state.LoadTradeStore(runtimeConfig.TradeHistoryPath, 100000)
+	if err != nil {
+		log.Fatal(err)
+	}
+	performanceStore, err := state.LoadPerformanceStore(runtimeConfig.PerformanceHistoryPath, 200000)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	chatService := chat.NewService(128)
 	var cache exchange.Cache
@@ -80,7 +88,7 @@ func main() {
 	}
 	randomEvents.Start(ctx)
 
-	gameEngine := gameplay.NewEngine(playerStore, allocator, exchangeService, chatService, chartEngine)
+	gameEngine := gameplay.NewEngine(playerStore, tradeStore, performanceStore, allocator, exchangeService, chatService, chartEngine)
 	intelEngine, err := intel.NewEngine(intel.Config{
 		Interval: time.Duration(runtimeConfig.IntelEventIntervalSecs) * time.Second,
 	}, intelDefs, exchangeService, gameEngine)
@@ -108,7 +116,7 @@ func main() {
 	reflection.Register(server)
 
 	log.Printf("grpc game service listening on %s", addr)
-	log.Printf("exchange core ready: tickers=%d chart_interval=%ds chart_history=%d chart_depth=%d random_event_interval=%ds random_events=%d intel_interval=%ds intel_defs=%d cache_enabled=%t", len(tickers), runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, runtimeConfig.RandomEventIntervalSecs, len(eventDefs), runtimeConfig.IntelEventIntervalSecs, len(intelDefs), cache != nil)
+	log.Printf("exchange core ready: tickers=%d chart_interval=%ds chart_history=%d chart_depth=%d random_event_interval=%ds random_events=%d intel_interval=%ds intel_defs=%d cache_enabled=%t trade_history=%s performance_history=%s", len(tickers), runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, runtimeConfig.RandomEventIntervalSecs, len(eventDefs), runtimeConfig.IntelEventIntervalSecs, len(intelDefs), cache != nil, runtimeConfig.TradeHistoryPath, runtimeConfig.PerformanceHistoryPath)
 	if err := server.Serve(lis); err != nil {
 		log.Fatal(err)
 	}

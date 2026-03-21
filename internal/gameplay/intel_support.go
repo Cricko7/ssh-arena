@@ -92,6 +92,9 @@ func (e *Engine) handleIntelBuy(ctx context.Context, req ExecuteActionRequest) (
 		_ = e.players.Upsert(player)
 		return "", err
 	}
+	if err := e.recordPlayerSnapshot(player); err != nil {
+		return "", err
+	}
 
 	return marshalJSON(map[string]any{
 		"type":      "intel.buy.result",

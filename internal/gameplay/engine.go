@@ -23,6 +23,8 @@ import (
 type Engine struct {
 	mu            sync.Mutex
 	players       *state.PlayerStore
+	tradeHistory  *state.TradeStore
+	performance   *state.PerformanceStore
 	allocator     *roles.Allocator
 	market        *exchange.Service
 	chat          *chat.Service
@@ -91,18 +93,20 @@ type chatPayload struct {
 	Body string `json:"body"`
 }
 
-func NewEngine(players *state.PlayerStore, allocator *roles.Allocator, market *exchange.Service, chatService *chat.Service, charts *charting.Engine) *Engine {
+func NewEngine(players *state.PlayerStore, tradeHistory *state.TradeStore, performance *state.PerformanceStore, allocator *roles.Allocator, market *exchange.Service, chatService *chat.Service, charts *charting.Engine) *Engine {
 	symbols := market.ListTickers()
 	sort.Strings(symbols)
 	return &Engine{
-		players:     players,
-		allocator:   allocator,
-		market:      market,
-		chat:        chatService,
-		charts:      charts,
-		symbols:     symbols,
-		openOrders:  make(map[string]*openOrder),
-		privateSubs: make(map[string]map[int]chan string),
+		players:      players,
+		tradeHistory: tradeHistory,
+		performance:  performance,
+		allocator:    allocator,
+		market:       market,
+		chat:         chatService,
+		charts:       charts,
+		symbols:      symbols,
+		openOrders:   make(map[string]*openOrder),
+		privateSubs:  make(map[string]map[int]chan string),
 	}
 }
 
@@ -117,6 +121,9 @@ func (e *Engine) EnsurePlayer(_ context.Context, req EnsurePlayerRequest) (Ensur
 		}
 		bootstrapJSON, err := e.bootstrapJSON(player)
 		if err != nil {
+			return EnsurePlayerResponse{}, err
+		}
+		if err := e.recordPlayerSnapshot(player); err != nil {
 			return EnsurePlayerResponse{}, err
 		}
 		return EnsurePlayerResponse{Player: player, BootstrapJSON: bootstrapJSON}, nil
@@ -141,6 +148,9 @@ func (e *Engine) EnsurePlayer(_ context.Context, req EnsurePlayerRequest) (Ensur
 	if err != nil {
 		return EnsurePlayerResponse{}, err
 	}
+	if err := e.recordPlayerSnapshot(player); err != nil {
+		return EnsurePlayerResponse{}, err
+	}
 	return EnsurePlayerResponse{Player: player, Created: true, BootstrapJSON: bootstrapJSON}, nil
 }
 
@@ -163,6 +173,10 @@ func (e *Engine) ExecuteAction(ctx context.Context, req ExecuteActionRequest) (s
 		return e.handleSendChat(ctx, req)
 	case "market.snapshot":
 		return e.handleMarketSnapshot(req)
+	case "trade.history", "trades.history":
+		return e.handleTradeHistory(req)
+	case "stats.leaderboard", "leaderboard":
+		return e.handleLeaderboard(req)
 	case "intel.catalog", "intel.list":
 		return e.handleIntelCatalog()
 	case "intel.buy":
@@ -287,6 +301,9 @@ func (e *Engine) handlePlaceOrder(ctx context.Context, req ExecuteActionRequest)
 		if err := e.players.Upsert(*changedPlayer); err != nil {
 			return "", err
 		}
+	}
+	if err := e.persistTradeEffects(touchedPlayers, result.Trades); err != nil {
+		return "", err
 	}
 
 	portfolio := e.snapshotPlayer(*touchedPlayers[player.PlayerID])
