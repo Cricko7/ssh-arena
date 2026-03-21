@@ -1,12 +1,12 @@
-﻿{
+{
   "feeds": [
     {
       "id": "insider.musk.buy",
       "kind": "insider",
-      "name": "Инсайд: крупная покупка <ticker>",
-      "description": "Платный инсайд на конкретное событие. Если оно выпадет, ты узнаешь о нём раньше рынка.",
-      "message": "Илон Маск купил <ticker>. Толпа резко уходит в покупки.",
-      "private_message": "Через несколько секунд рынок увидит новость по <ticker>. Готовься к импульсу вверх.",
+      "name": "Insider: major buy in <ticker>",
+      "description": "Paid insider access for a specific future event. If it triggers, you will hear about it before the rest of the market.",
+      "message": "Elon Musk bought <ticker>. The crowd is rushing into the bid.",
+      "private_message": "In a few seconds the market will see a headline about <ticker>. Prepare for an upside impulse.",
       "chance": 6,
       "price": 18000,
       "market_multiplier": "10-20",
@@ -17,9 +17,9 @@
     {
       "id": "rumor.investigation",
       "kind": "rumor",
-      "name": "Слухи о расследовании по <ticker>",
-      "description": "Публичный слух. Может резко ухудшить настроение по тикеру.",
-      "message": "По <ticker> пошли слухи о возможном расследовании. Лента быстро краснеет.",
+      "name": "Rumors of an investigation into <ticker>",
+      "description": "A public rumor that can sharply damage market sentiment for one ticker.",
+      "message": "Rumors of an investigation are spreading around <ticker>. The tape is turning red fast.",
       "chance": 8,
       "market_multiplier": "-14--6",
       "duration_seconds": 70,
@@ -28,9 +28,9 @@
     {
       "id": "fake.breakthrough",
       "kind": "fake_news",
-      "name": "Фейковая новость о прорыве в <ticker>",
-      "description": "Псевдоновость, которая может спровоцировать памп до выяснения деталей.",
-      "message": "В сети разгоняют новость о прорыве в <ticker>. Толпа покупает на эмоциях.",
+      "name": "Fake breakthrough story in <ticker>",
+      "description": "A fake headline that can trigger a pump before traders verify the details.",
+      "message": "A breakthrough headline about <ticker> is being amplified online. The crowd is buying on emotion.",
       "chance": 7,
       "market_multiplier": "6-16",
       "duration_seconds": 55,
@@ -39,9 +39,9 @@
     {
       "id": "analytics.crypto.momentum",
       "kind": "paid_analytics",
-      "name": "Momentum-аналитика по <ticker>",
-      "description": "Платный аналитический отчёт с bias, текущей ценой и стаканом.",
-      "message": "Аналитики видят по <ticker> повышенный импульс и советуют искать точку входа по направлению доминирующего движения.",
+      "name": "Momentum analytics for <ticker>",
+      "description": "A paid analytics report with bias, current price, and order book context.",
+      "message": "Analysts see elevated momentum in <ticker> and recommend looking for entries in the direction of dominant flow.",
       "price": 6500,
       "market_multiplier": "5-12",
       "duration_seconds": 0,
@@ -50,9 +50,9 @@
     {
       "id": "analytics.market.riskoff",
       "kind": "paid_analytics",
-      "name": "Макро-аналитика risk-off",
-      "description": "Общий рыночный отчёт с оценкой риска и импульса.",
-      "message": "Модель риск-менеджмента сигнализирует о сдвиге рынка в защитный режим. Следи за ликвидностью и скоростью снятия заявок.",
+      "name": "Macro risk-off analytics",
+      "description": "A broad market report with risk and momentum context.",
+      "message": "The risk model signals a shift toward defensive positioning. Watch liquidity and order cancellations carefully.",
       "price": 9000,
       "market_multiplier": "-8--2",
       "duration_seconds": 0,
@@ -61,4 +61,3 @@
     }
   ]
 }
-

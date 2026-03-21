@@ -2,16 +2,15 @@ package marketevents
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/rand"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aeza/ssh-arena/internal/exchange"
+	"github.com/aeza/ssh-arena/internal/jsonfile"
 )
 
 type Definition struct {
@@ -57,13 +56,9 @@ type Market interface {
 var rangePattern = regexp.MustCompile(`^(-?\d+)-(-?\d+)$`)
 
 func LoadDefinitions(path string) ([]Definition, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read random events config: %w", err)
-	}
 	var catalog Catalog
-	if err := json.Unmarshal(raw, &catalog); err != nil {
-		return nil, fmt.Errorf("decode random events config: %w", err)
+	if err := jsonfile.Read(path, &catalog); err != nil {
+		return nil, fmt.Errorf("read random events config: %w", err)
 	}
 	return catalog.Events, nil
 }

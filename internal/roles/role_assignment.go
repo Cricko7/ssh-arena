@@ -1,14 +1,14 @@
 package roles
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
-	"os"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/aeza/ssh-arena/internal/jsonfile"
 )
 
 type Role string
@@ -62,14 +62,9 @@ func NewAllocatorWithSeed(config Config, seed int64) *Allocator {
 }
 
 func LoadConfig(path string) (Config, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("read role config: %w", err)
-	}
-
 	var config Config
-	if err := json.Unmarshal(raw, &config); err != nil {
-		return Config{}, fmt.Errorf("decode role config: %w", err)
+	if err := jsonfile.Read(path, &config); err != nil {
+		return Config{}, fmt.Errorf("read role config: %w", err)
 	}
 	return config, nil
 }

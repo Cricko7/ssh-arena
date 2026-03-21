@@ -39,9 +39,10 @@ func newBootstrapClient(target string) (*bootstrapClient, *grpc.ClientConn, erro
 func main() {
 	addr := envOr("SSH_LISTEN_ADDR", ":2222")
 	hostSigner := envOr("SSH_HOST_KEY_PATH", "./config/dev/ssh_host_ed25519")
-	grpcAddr := envOr("GRPC_GAME_ADDR", envOr("GRPC_LISTEN_ADDR", "127.0.0.1:9090"))
+	grpcTarget := envOr("GRPC_GAME_ADDR", envOr("GRPC_LISTEN_ADDR", "127.0.0.1:9090"))
+	grpcPublicAddr := envOr("GRPC_PUBLIC_ADDR", grpcTarget)
 
-	client, conn, err := newBootstrapClient(grpcAddr)
+	client, conn, err := newBootstrapClient(grpcTarget)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -49,7 +50,7 @@ func main() {
 
 	server := &gossh.Server{
 		Addr:             addr,
-		Handler:          sessionHandler(client, grpcAddr),
+		Handler:          sessionHandler(client, grpcPublicAddr),
 		PasswordHandler:  passwordHandler,
 		PublicKeyHandler: publicKeyHandler,
 		IdleTimeout:      2 * time.Minute,
@@ -60,13 +61,13 @@ func main() {
 		server.SetOption(gossh.HostKeyFile(hostSigner))
 	}
 
-	log.Printf("ssh bootstrap gateway listening on %s and forwarding to %s", addr, grpcAddr)
+	log.Printf("ssh bootstrap gateway listening on %s, forwarding to %s, advertising %s", addr, grpcTarget, grpcPublicAddr)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func sessionHandler(client *bootstrapClient, grpcAddr string) gossh.Handler {
+func sessionHandler(client *bootstrapClient, grpcPublicAddr string) gossh.Handler {
 	return func(session gossh.Session) {
 		ctx, cancel := context.WithTimeout(session.Context(), 5*time.Second)
 		defer cancel()
@@ -87,7 +88,7 @@ func sessionHandler(client *bootstrapClient, grpcAddr string) gossh.Handler {
 		}
 
 		_, _ = fmt.Fprintf(session, "welcome, %s\r\n", session.User())
-		_, _ = fmt.Fprintf(session, "grpc_endpoint=%s\r\n", grpcAddr)
+		_, _ = fmt.Fprintf(session, "grpc_endpoint=%s\r\n", grpcPublicAddr)
 		_, _ = fmt.Fprintln(session, resp.BootstrapJSON)
 		_, _ = fmt.Fprintln(session, `{"type":"ssh.bootstrap.complete","message":"Use gRPC for gameplay commands, chat, charts and market streams."}`)
 		_, _ = fmt.Fprintln(session, "disconnecting from SSH bootstrap gateway")

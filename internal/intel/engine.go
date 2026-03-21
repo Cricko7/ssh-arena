@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aeza/ssh-arena/internal/exchange"
+	"github.com/aeza/ssh-arena/internal/jsonfile"
 )
 
 type Kind string
@@ -92,13 +92,9 @@ type Engine struct {
 }
 
 func LoadDefinitions(path string) ([]Definition, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read intel config: %w", err)
-	}
 	var catalog Catalog
-	if err := json.Unmarshal(raw, &catalog); err != nil {
-		return nil, fmt.Errorf("decode intel config: %w", err)
+	if err := jsonfile.Read(path, &catalog); err != nil {
+		return nil, fmt.Errorf("read intel config: %w", err)
 	}
 	return catalog.Feeds, nil
 }
@@ -189,7 +185,7 @@ func (e *Engine) Buy(ctx context.Context, playerID string, intelID string) (BuyR
 			"price_paid":   def.Price,
 			"lead_time":    def.LeadTimeSeconds,
 			"description":  def.Description,
-			"message":      "РРЅСЃР°Р№Рґ РєСѓРїР»РµРЅ. РљРѕРіРґР° СЌС‚Рѕ СЃРѕР±С‹С‚РёРµ РІС‹РїР°РґРµС‚, С‚С‹ СѓР·РЅР°РµС€СЊ Рѕ РЅС‘Рј СЂР°РЅСЊС€Рµ РѕСЃС‚Р°Р»СЊРЅС‹С….",
+			"message":      "Insider access armed. If this event triggers, you will get the preview before the rest of the market.",
 			"purchased_at": time.Now().UTC(),
 		}
 		return BuyResult{Cost: def.Price, PayloadJSON: marshal(payload)}, nil

@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   grpc-game:
     build:
@@ -45,6 +43,7 @@ services:
       SSH_HOST_KEY_PATH: "/var/lib/ssh-arena/ssh/ssh_host_ed25519"
       REDIS_ADDR: "redis:6379"
       GRPC_GAME_ADDR: "grpc-game:9090"
+      GRPC_PUBLIC_ADDR: "localhost:9090"
     ports:
       - "2222:2222"
     volumes:
