@@ -260,7 +260,7 @@ func (s *Service) TriggerMarketEvent(ctx context.Context, input EventShockInput)
 		}
 		_ = s.cache.Publish(ctx, "arena.events", jsonPayload)
 	}
-	if s.chat != nil {
+	if s.chat != nil && input.Kind != "random_event" {
 		_, _ = s.chat.Broadcast(ctx, chat.Message{
 			Type:     "system.event",
 			Channel:  "global",

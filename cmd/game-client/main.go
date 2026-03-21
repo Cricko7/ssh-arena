@@ -11,12 +11,15 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/status"
 
 	gamev1 "github.com/aeza/ssh-arena/gen/game/v1"
 	"github.com/aeza/ssh-arena/internal/charting"
@@ -176,6 +179,15 @@ var timeframePresets = []timeframePreset{
 	{Label: "1h", Duration: time.Hour},
 	{Label: "all", Duration: 0},
 }
+
+type actionClientCache struct {
+	mu   sync.Mutex
+	addr string
+	conn *grpc.ClientConn
+	api  gamev1.GameServiceClient
+}
+
+var sharedActionClient actionClientCache
 
 func newPalette() palette {
 	p := palette{
@@ -703,35 +715,93 @@ func executeActionJSON(cfg config, actionID string, payload any) (string, error)
 	if codec == nil {
 		return "", fmt.Errorf("json gRPC codec is not registered")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(ctx, cfg.GRPCAddr,
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		api, err := sharedActionClient.client(ctx, cfg.GRPCAddr, codec)
+		if err == nil {
+			resp, callErr := api.ExecuteAction(ctx, &gamev1.ActionRequest{
+				RequestID:   fmt.Sprintf("ui-%d", time.Now().UnixNano()),
+				PlayerID:    cfg.PlayerID,
+				ActionID:    actionID,
+				PayloadJSON: string(raw),
+			})
+			cancel()
+			if callErr == nil {
+				if resp.Status != "ok" {
+					return "", fmt.Errorf("%s", extractErrorMessage(resp.ResponseJSON))
+				}
+				return resp.ResponseJSON, nil
+			}
+			lastErr = callErr
+		} else {
+			cancel()
+			lastErr = err
+		}
+		sharedActionClient.reset(cfg.GRPCAddr)
+		if !shouldRetryAction(lastErr) {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 350 * time.Millisecond)
+	}
+	return "", lastErr
+}
+
+func shouldRetryAction(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch status.Code(err) {
+	case codes.DeadlineExceeded, codes.Unavailable, codes.Canceled:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *actionClientCache) client(ctx context.Context, addr string, codec encoding.Codec) (gamev1.GameServiceClient, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil && c.addr == addr && c.api != nil {
+		return c.api, nil
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+		c.api = nil
+		c.addr = ""
+	}
+	conn, err := grpc.DialContext(ctx, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(codec)),
 		grpc.WithBlock(),
 	)
 	if err != nil {
-		return "", fmt.Errorf("grpc dial: %w", err)
+		return nil, fmt.Errorf("grpc dial: %w", err)
 	}
-	defer conn.Close()
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
+	c.conn = conn
+	c.api = gamev1.NewGameServiceClient(conn)
+	c.addr = addr
+	return c.api, nil
+}
+
+func (c *actionClientCache) reset(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if addr != "" && c.addr != "" && c.addr != addr {
+		return
 	}
-	api := gamev1.NewGameServiceClient(conn)
-	resp, err := api.ExecuteAction(ctx, &gamev1.ActionRequest{
-		RequestID:   fmt.Sprintf("ui-%d", time.Now().UnixNano()),
-		PlayerID:    cfg.PlayerID,
-		ActionID:    actionID,
-		PayloadJSON: string(raw),
-	})
-	if err != nil {
-		return "", err
+	if c.conn != nil {
+		_ = c.conn.Close()
 	}
-	if resp.Status != "ok" {
-		return "", fmt.Errorf("%s", extractErrorMessage(resp.ResponseJSON))
-	}
-	return resp.ResponseJSON, nil
+	c.conn = nil
+	c.api = nil
+	c.addr = ""
 }
 
 func applyActionResponse(state *uiState, msg actionResponseMsg) {

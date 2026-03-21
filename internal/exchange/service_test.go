@@ -10,6 +10,7 @@ import (
 )
 
 func TestTriggerMarketEventPublishesEnvelopeAndMovesPrice(t *testing.T) {
+	chatService := chat.NewService(8, nil)
 	service := NewService([]Ticker{{
 		Symbol:         "TECH",
 		Name:           "Tech",
@@ -18,7 +19,7 @@ func TestTriggerMarketEventPublishesEnvelopeAndMovesPrice(t *testing.T) {
 		TickSize:       5,
 		LiquidityUnits: 10000,
 		WhaleThreshold: 500,
-	}}, chat.NewService(8, nil), nil)
+	}}, chatService, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -67,5 +68,9 @@ func TestTriggerMarketEventPublishesEnvelopeAndMovesPrice(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for market.event publication")
+	}
+
+	if got := len(chatService.History()); got != 0 {
+		t.Fatalf("expected random_event to stay out of chat history, got %d messages", got)
 	}
 }

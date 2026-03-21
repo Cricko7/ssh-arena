@@ -30,7 +30,7 @@ func DefaultRuntimeConfig() RuntimeConfig {
 		TradeHistoryPath:         "data/trades.json",
 		PerformanceHistoryPath:   "data/performance.json",
 		ChatHistoryPath:          "data/chat.json",
-		RandomEventIntervalSecs:  15,
+		RandomEventIntervalSecs:  90,
 		RandomEventsPath:         "events/random_events.json",
 		IntelEventIntervalSecs:   12,
 		IntelEventsPath:          "events/intel_feeds.json",
@@ -71,7 +71,7 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 		cfg.ChatHistoryPath = "data/chat.json"
 	}
 	if cfg.RandomEventIntervalSecs <= 0 {
-		cfg.RandomEventIntervalSecs = 15
+		cfg.RandomEventIntervalSecs = 90
 	}
 	if cfg.RandomEventsPath == "" {
 		cfg.RandomEventsPath = "events/random_events.json"
