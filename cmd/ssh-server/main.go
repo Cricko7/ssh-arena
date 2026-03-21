@@ -16,6 +16,7 @@ import (
 
 	gamev1 "github.com/aeza/ssh-arena/gen/game/v1"
 	"github.com/aeza/ssh-arena/internal/grpcjson"
+	"github.com/aeza/ssh-arena/internal/logx"
 )
 
 type bootstrapClient struct {
@@ -37,6 +38,7 @@ func newBootstrapClient(target string) (*bootstrapClient, *grpc.ClientConn, erro
 }
 
 func main() {
+	logger := logx.L("cmd.ssh-server")
 	addr := envOr("SSH_LISTEN_ADDR", ":2222")
 	hostSigner := envOr("SSH_HOST_KEY_PATH", "./config/dev/ssh_host_ed25519")
 	grpcTarget := envOr("GRPC_GAME_ADDR", envOr("GRPC_LISTEN_ADDR", "127.0.0.1:9090"))
@@ -44,13 +46,14 @@ func main() {
 
 	client, conn, err := newBootstrapClient(grpcTarget)
 	if err != nil {
-		panic(err)
+		logger.Error("create bootstrap client", "error", err, "target", grpcTarget)
+		os.Exit(1)
 	}
 	defer conn.Close()
 
 	server := &gossh.Server{
 		Addr:             addr,
-		Handler:          sessionHandler(client, grpcPublicAddr),
+		Handler:          sessionHandler(logger, client, grpcPublicAddr),
 		PasswordHandler:  passwordHandler,
 		PublicKeyHandler: publicKeyHandler,
 		IdleTimeout:      2 * time.Minute,
@@ -59,15 +62,22 @@ func main() {
 
 	if _, err := os.Stat(hostSigner); err == nil {
 		server.SetOption(gossh.HostKeyFile(hostSigner))
+		logger.Info("ssh host key loaded", "path", hostSigner)
+	} else {
+		logger.Warn("ssh host key not found, using in-memory key", "path", hostSigner, "error", err)
 	}
 
-	fmt.Printf("ssh bootstrap gateway listening on %s, forwarding to %s, advertising %s\n", addr, grpcTarget, grpcPublicAddr)
+	logger.Info("ssh bootstrap gateway listening", "addr", addr, "grpc_target", grpcTarget, "grpc_public_addr", grpcPublicAddr)
 	if err := server.ListenAndServe(); err != nil {
-		panic(err)
+		logger.Error("ssh server stopped", "error", err)
+		os.Exit(1)
 	}
 }
 
-func sessionHandler(client *bootstrapClient, grpcPublicAddr string) gossh.Handler {
+func sessionHandler(logger interface {
+	Info(string, ...any)
+	Warn(string, ...any)
+}, client *bootstrapClient, grpcPublicAddr string) gossh.Handler {
 	return func(session gossh.Session) {
 		ctx, cancel := context.WithTimeout(session.Context(), 5*time.Second)
 		defer cancel()
@@ -77,12 +87,14 @@ func sessionHandler(client *bootstrapClient, grpcPublicAddr string) gossh.Handle
 			keyHash = xssh.FingerprintSHA256(pk)
 		}
 
+		logger.Info("ssh bootstrap started", "username", session.User(), "remote_addr", remoteIP(session.RemoteAddr()), "has_public_key", keyHash != "")
 		resp, err := client.account.EnsurePlayer(ctx, &gamev1.PlayerBootstrapRequest{
 			SSHUsername:          session.User(),
 			RemoteAddr:           remoteIP(session.RemoteAddr()),
 			PublicKeyFingerprint: keyHash,
 		})
 		if err != nil {
+			logger.Warn("ssh bootstrap failed", "username", session.User(), "error", err)
 			_, _ = fmt.Fprintf(session, "bootstrap failed: %v\r\n", err)
 			return
 		}
@@ -106,6 +118,7 @@ func sessionHandler(client *bootstrapClient, grpcPublicAddr string) gossh.Handle
 		_, _ = fmt.Fprintln(session, installJSON)
 		_, _ = fmt.Fprintln(session, `{"type":"ssh.bootstrap.complete","message":"Use the local game-client for charts, gameplay, chat and market streams. It will reuse the saved player_id on the next launch."}`)
 		_, _ = fmt.Fprintln(session, "disconnecting from SSH bootstrap gateway")
+		logger.Info("ssh bootstrap completed", "username", session.User(), "player_id", resp.PlayerID, "role", resp.Role, "created", resp.Created)
 	}
 }
 

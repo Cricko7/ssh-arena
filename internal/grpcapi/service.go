@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
 	gamev1 "github.com/aeza/ssh-arena/gen/game/v1"
 	"github.com/aeza/ssh-arena/internal/gameplay"
+	"github.com/aeza/ssh-arena/internal/logx"
 )
 
 type Service struct {
@@ -19,21 +21,25 @@ type Service struct {
 
 	engine   *gameplay.Engine
 	sequence atomic.Int64
+	logger   *slog.Logger
 }
 
 func New(engine *gameplay.Engine) *Service {
-	return &Service{engine: engine}
+	return &Service{engine: engine, logger: logx.L("grpcapi")}
 }
 
 func (s *Service) EnsurePlayer(ctx context.Context, req *gamev1.PlayerBootstrapRequest) (*gamev1.PlayerBootstrapResponse, error) {
+	start := time.Now()
 	result, err := s.engine.EnsurePlayer(ctx, gameplay.EnsurePlayerRequest{
 		Username:             req.SSHUsername,
 		RemoteAddr:           req.RemoteAddr,
 		PublicKeyFingerprint: req.PublicKeyFingerprint,
 	})
 	if err != nil {
+		s.logger.Warn("ensure player failed", "username", req.SSHUsername, "remote_addr", req.RemoteAddr, "error", err, "duration", time.Since(start))
 		return nil, err
 	}
+	s.logger.Info("player ensured", "username", req.SSHUsername, "player_id", result.Player.PlayerID, "role", result.Player.Role, "created", result.Created, "duration", time.Since(start))
 	return &gamev1.PlayerBootstrapResponse{
 		PlayerID:      result.Player.PlayerID,
 		Role:          result.Player.Role,
@@ -47,6 +53,7 @@ func (s *Service) ExecuteAction(ctx context.Context, req *gamev1.ActionRequest) 
 	if requestID == "" {
 		requestID = fmt.Sprintf("req-%d", time.Now().UnixNano())
 	}
+	start := time.Now()
 	responseJSON, err := s.engine.ExecuteAction(ctx, gameplay.ExecuteActionRequest{
 		RequestID: requestID,
 		PlayerID:  req.PlayerID,
@@ -55,6 +62,7 @@ func (s *Service) ExecuteAction(ctx context.Context, req *gamev1.ActionRequest) 
 		Metadata:  req.Metadata,
 	})
 	if err != nil {
+		s.logger.Warn("action failed", "request_id", requestID, "player_id", req.PlayerID, "action_id", req.ActionID, "error", err, "duration", time.Since(start))
 		return &gamev1.ActionResponse{
 			RequestID:    requestID,
 			ActionID:     req.ActionID,
@@ -62,6 +70,7 @@ func (s *Service) ExecuteAction(ctx context.Context, req *gamev1.ActionRequest) 
 			ResponseJSON: fmt.Sprintf(`{"type":"error","message":%q}`, err.Error()),
 		}, nil
 	}
+	s.logger.Info("action completed", "request_id", requestID, "player_id", req.PlayerID, "action_id", req.ActionID, "duration", time.Since(start))
 	return &gamev1.ActionResponse{
 		RequestID:    requestID,
 		ActionID:     req.ActionID,
@@ -72,6 +81,10 @@ func (s *Service) ExecuteAction(ctx context.Context, req *gamev1.ActionRequest) 
 
 func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServer) error {
 	ctx := stream.Context()
+	logger := s.logger.With("rpc", "GetMarketStream")
+	logger.Info("market stream opened")
+	defer logger.Info("market stream closed")
+
 	marketFeed := s.engine.MarketFeed(ctx)
 	chatFeed := s.engine.ChatFeed(ctx)
 	requests := make(chan *gamev1.MarketStreamRequest, 4)
@@ -104,8 +117,12 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 	for {
 		select {
 		case <-ctx.Done():
+			logger.Info("market stream context done", "player_id", playerID, "error", ctx.Err())
 			return ctx.Err()
 		case err := <-errCh:
+			if err != nil {
+				logger.Warn("market stream receive failed", "player_id", playerID, "error", err)
+			}
 			return err
 		case req, ok := <-requests:
 			if !ok {
@@ -120,6 +137,7 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 			includeChat = req.IncludeChat
 			if includeChat {
 				if err := s.sendInitialChatState(stream, playerID); err != nil {
+					logger.Warn("send initial chat state failed", "player_id", playerID, "error", err)
 					return err
 				}
 				if chatFeed == nil {
@@ -133,7 +151,9 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 			for _, symbol := range req.Symbols {
 				symbols[symbol] = struct{}{}
 			}
+			logger.Info("market stream subscription updated", "player_id", playerID, "symbols", req.Symbols, "include_portfolio", includePortfolio, "include_chat", includeChat)
 			if err := s.sendInitialMarketState(stream, playerID, symbols, includePortfolio); err != nil {
+				logger.Warn("send initial market state failed", "player_id", playerID, "error", err)
 				return err
 			}
 		case payload := <-marketFeed:
@@ -141,6 +161,7 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 				continue
 			}
 			if err := stream.Send(s.envelope("market", payload)); err != nil {
+				logger.Warn("send market payload failed", "player_id", playerID, "error", err)
 				return err
 			}
 		case payload := <-chatFeed:
@@ -148,6 +169,7 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 				continue
 			}
 			if err := stream.Send(s.envelope("chat", payload)); err != nil {
+				logger.Warn("send chat payload failed", "player_id", playerID, "error", err)
 				return err
 			}
 		case payload, ok := <-privateFeed:
@@ -155,10 +177,12 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 				continue
 			}
 			if err := stream.Send(s.envelope("private", payload)); err != nil {
+				logger.Warn("send private payload failed", "player_id", playerID, "error", err)
 				return err
 			}
 		case <-ticker.C:
 			if err := s.sendInitialMarketState(stream, playerID, symbols, includePortfolio); err != nil {
+				logger.Warn("refresh market state failed", "player_id", playerID, "error", err)
 				return err
 			}
 		}
@@ -167,6 +191,9 @@ func (s *Service) GetMarketStream(stream gamev1.GameService_GetMarketStreamServe
 
 func (s *Service) SubscribeToChart(stream gamev1.GameService_SubscribeToChartServer) error {
 	ctx := stream.Context()
+	logger := s.logger.With("rpc", "SubscribeToChart")
+	logger.Info("chart stream opened")
+	defer logger.Info("chart stream closed")
 	out := make(chan string, 64)
 	errCh := make(chan error, 1)
 
@@ -181,6 +208,7 @@ func (s *Service) SubscribeToChart(stream gamev1.GameService_SubscribeToChartSer
 				}
 				return
 			}
+			logger.Info("chart subscription updated", "player_id", req.PlayerID, "ticker", req.Ticker, "history_limit", req.HistoryLimit, "depth", req.OrderbookDepth)
 			ch, err := s.engine.SubscribeChart(ctx, req.PlayerID, req.Ticker, int(req.HistoryLimit), int(req.OrderbookDepth))
 			if err != nil {
 				errCh <- err
@@ -203,6 +231,9 @@ func (s *Service) SubscribeToChart(stream gamev1.GameService_SubscribeToChartSer
 		case <-ctx.Done():
 			return ctx.Err()
 		case err := <-errCh:
+			if err != nil {
+				logger.Warn("chart stream failed", "error", err)
+			}
 			return err
 		case payload := <-out:
 			if err := stream.Send(&gamev1.PriceChartTick{
@@ -210,6 +241,7 @@ func (s *Service) SubscribeToChart(stream gamev1.GameService_SubscribeToChartSer
 				JSON:     payload,
 				Sequence: s.nextSequence(),
 			}); err != nil {
+				logger.Warn("send chart tick failed", "error", err)
 				return err
 			}
 		}
@@ -221,17 +253,23 @@ func (s *Service) SendChat(ctx context.Context, req *gamev1.ChatRequest) (*gamev
 		Body string `json:"body"`
 	}
 	if err := json.Unmarshal([]byte(req.JSON), &payload); err != nil {
+		s.logger.Warn("decode send chat payload failed", "player_id", req.PlayerID, "error", err)
 		return nil, err
 	}
 	messageJSON, err := s.engine.SendChat(ctx, req.PlayerID, payload.Body, "")
 	if err != nil {
+		s.logger.Warn("send chat failed", "player_id", req.PlayerID, "error", err)
 		return nil, err
 	}
+	s.logger.Info("chat message sent", "player_id", req.PlayerID, "body_length", len(payload.Body))
 	return s.envelope("chat", messageJSON), nil
 }
 
 func (s *Service) StreamChat(req *gamev1.MarketStreamRequest, stream gamev1.ChatService_StreamChatServer) error {
 	ctx := stream.Context()
+	logger := s.logger.With("rpc", "StreamChat", "player_id", req.PlayerID)
+	logger.Info("chat stream opened")
+	defer logger.Info("chat stream closed")
 	feed := s.engine.ChatFeed(ctx)
 	for {
 		select {
@@ -245,6 +283,7 @@ func (s *Service) StreamChat(req *gamev1.MarketStreamRequest, stream gamev1.Chat
 				continue
 			}
 			if err := stream.Send(s.envelope("chat", payload)); err != nil {
+				logger.Warn("send chat stream payload failed", "error", err)
 				return err
 			}
 		}

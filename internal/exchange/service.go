@@ -3,12 +3,14 @@ package exchange
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/aeza/ssh-arena/internal/chat"
+	"github.com/aeza/ssh-arena/internal/logx"
 	"github.com/aeza/ssh-arena/internal/orderbook"
 )
 
@@ -22,6 +24,7 @@ type Service struct {
 	recentTrades map[string][]orderbook.Trade
 	nextSubID    int
 	subscribers  map[int]chan string
+	logger       *slog.Logger
 }
 
 func NewService(tickers []Ticker, chatService *chat.Service, cache Cache) *Service {
@@ -32,7 +35,7 @@ func NewService(tickers []Ticker, chatService *chat.Service, cache Cache) *Servi
 		tickerMap[ticker.Symbol] = ticker
 	}
 
-	return &Service{
+	service := &Service{
 		books:        bookMap,
 		tickers:      tickerMap,
 		priceEngine:  NewPriceEngine(tickers),
@@ -40,7 +43,10 @@ func NewService(tickers []Ticker, chatService *chat.Service, cache Cache) *Servi
 		cache:        cache,
 		recentTrades: make(map[string][]orderbook.Trade, len(tickers)),
 		subscribers:  make(map[int]chan string),
+		logger:       logx.L("exchange"),
 	}
+	service.logger.Info("exchange service initialized", "tickers", len(tickers), "cache_enabled", cache != nil)
+	return service
 }
 
 func (s *Service) ListTickers() []string {
@@ -59,14 +65,18 @@ func (s *Service) Subscribe(ctx context.Context) <-chan string {
 	s.nextSubID++
 	ch := make(chan string, 64)
 	s.subscribers[id] = ch
+	subscriberCount := len(s.subscribers)
 	s.mu.Unlock()
+	s.logger.Info("market subscriber connected", "subscriber_id", id, "subscribers", subscriberCount)
 
 	go func() {
 		<-ctx.Done()
 		s.mu.Lock()
 		delete(s.subscribers, id)
+		remaining := len(s.subscribers)
 		close(ch)
 		s.mu.Unlock()
+		s.logger.Info("market subscriber disconnected", "subscriber_id", id, "subscribers", remaining)
 	}()
 	return ch
 }
@@ -97,11 +107,13 @@ func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceO
 		Quantity:   input.Quantity,
 	})
 	if err != nil {
+		s.logger.Warn("place order failed", "player_id", input.PlayerID, "symbol", input.Symbol, "side", input.Side, "type", input.Type, "quantity", input.Quantity, "price", input.Price, "error", err)
 		return PlaceOrderOutput{}, err
 	}
 
 	price, err := s.priceEngine.Apply(input.Symbol, result.Trades, result.Snapshot)
 	if err != nil {
+		s.logger.Warn("apply price update failed", "symbol", input.Symbol, "order_id", result.Order.ID, "error", err)
 		return PlaceOrderOutput{}, err
 	}
 
@@ -144,6 +156,12 @@ func (s *Service) PlaceOrder(ctx context.Context, input PlaceOrderInput) (PlaceO
 		}
 	}
 
+	status := "filled"
+	if result.Resting != nil {
+		status = string(result.Resting.Status)
+	}
+	s.logger.Info("order processed", "player_id", input.PlayerID, "order_id", result.Order.ID, "symbol", input.Symbol, "side", input.Side, "type", input.Type, "quantity", input.Quantity, "price", input.Price, "trades", len(executedTrades), "removed", len(result.Removed), "status", status)
+
 	return PlaceOrderOutput{
 		Order:      result.Order,
 		OrderBook:  result.Snapshot,
@@ -166,6 +184,7 @@ func (s *Service) CancelOrder(ctx context.Context, symbol string, orderID string
 	}
 	cancelled, snapshot, err := book.Cancel(orderID)
 	if err != nil {
+		s.logger.Warn("cancel order failed", "symbol", symbol, "order_id", orderID, "error", err)
 		return "", err
 	}
 	price, err := s.priceEngine.Current(symbol)
@@ -187,6 +206,7 @@ func (s *Service) CancelOrder(ctx context.Context, symbol string, orderID string
 		_ = s.cache.PutSnapshot(ctx, symbol, jsonPayload)
 		_ = s.cache.Publish(ctx, "arena.market."+symbol, jsonPayload)
 	}
+	s.logger.Info("order cancelled", "symbol", symbol, "order_id", orderID, "player_id", cancelled.PlayerID)
 	return jsonPayload, nil
 }
 
@@ -260,18 +280,7 @@ func (s *Service) TriggerMarketEvent(ctx context.Context, input EventShockInput)
 		}
 		_ = s.cache.Publish(ctx, "arena.events", jsonPayload)
 	}
-	if s.chat != nil && input.Kind != "random_event" {
-		_, _ = s.chat.Broadcast(ctx, chat.Message{
-			Type:     "system.event",
-			Channel:  "global",
-			PlayerID: "system",
-			Username: "market-bot",
-			Role:     "System",
-			Body:     input.Message,
-			SentAt:   occurredAt,
-		})
-	}
-
+	s.logger.Info("market event applied", "kind", input.Kind, "name", input.EventName, "global", input.Global, "symbol", input.Symbol, "affected_symbols", affected, "multiplier_pct", input.MultiplierPct, "duration", input.Duration)
 	return EventShockOutput{
 		JSON:            jsonPayload,
 		AffectedSymbols: affected,

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/aeza/ssh-arena/internal/logx"
 	"github.com/aeza/ssh-arena/internal/state"
 )
 
@@ -29,6 +31,7 @@ type Service struct {
 	history      []string
 	historyLimit int
 	store        *state.ChatStore
+	logger       *slog.Logger
 }
 
 func NewService(historyLimit int, store *state.ChatStore) *Service {
@@ -39,6 +42,7 @@ func NewService(historyLimit int, store *state.ChatStore) *Service {
 		subscribers:  make(map[int]chan string),
 		historyLimit: historyLimit,
 		store:        store,
+		logger:       logx.L("chat"),
 	}
 	if store != nil {
 		for _, item := range store.Query(state.ChatQuery{Channel: "global", Limit: historyLimit}) {
@@ -46,6 +50,7 @@ func NewService(historyLimit int, store *state.ChatStore) *Service {
 				service.history = append(service.history, payload)
 			}
 		}
+		service.logger.Info("chat history restored", "count", len(service.history), "limit", historyLimit)
 	}
 	return service
 }
@@ -71,15 +76,19 @@ func (s *Service) SubscribeLive(ctx context.Context) chan string {
 	s.nextID++
 	ch := make(chan string, 32)
 	s.subscribers[id] = ch
+	subscriberCount := len(s.subscribers)
 	s.mu.Unlock()
+	s.logger.Info("chat subscriber connected", "subscriber_id", id, "subscribers", subscriberCount)
 
 	go func() {
 		<-ctx.Done()
 
 		s.mu.Lock()
 		delete(s.subscribers, id)
+		remaining := len(s.subscribers)
 		close(ch)
 		s.mu.Unlock()
+		s.logger.Info("chat subscriber disconnected", "subscriber_id", id, "subscribers", remaining)
 	}()
 
 	return ch
@@ -127,20 +136,24 @@ func (s *Service) Broadcast(ctx context.Context, message Message) (string, error
 	if s.store != nil {
 		if err := s.store.Append(state.ChatMessage(message)); err != nil {
 			s.mu.Unlock()
+			s.logger.Warn("persist chat message failed", "channel", message.Channel, "player_id", message.PlayerID, "error", err)
 			return "", err
 		}
 	}
+	subscriberCount := len(s.subscribers)
 	for _, subscriber := range s.subscribers {
 		select {
 		case subscriber <- payload:
 		case <-ctx.Done():
 			s.mu.Unlock()
+			s.logger.Warn("broadcast chat cancelled", "channel", message.Channel, "player_id", message.PlayerID, "error", ctx.Err())
 			return "", ctx.Err()
 		default:
 		}
 	}
 	s.mu.Unlock()
 
+	s.logger.Info("chat message broadcast", "type", message.Type, "channel", message.Channel, "player_id", message.PlayerID, "recipient_id", message.RecipientID, "body_length", len(message.Body), "subscribers", subscriberCount)
 	return payload, nil
 }
 

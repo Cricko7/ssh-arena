@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"time"
 
 	"github.com/aeza/ssh-arena/internal/exchange"
+	"github.com/aeza/ssh-arena/internal/logx"
 	"github.com/aeza/ssh-arena/internal/orderbook"
 )
 
@@ -78,6 +80,7 @@ type Engine struct {
 	states      map[string]*tickerState
 	subscribers map[string]map[int]subscription
 	nextID      int
+	logger      *slog.Logger
 }
 
 type MarketSource interface {
@@ -106,11 +109,14 @@ func NewEngine(cfg Config, market MarketSource) *Engine {
 		market:      market,
 		states:      states,
 		subscribers: make(map[string]map[int]subscription),
+		logger:      logx.L("charting"),
 	}
 }
 
 func (e *Engine) Start(ctx context.Context) {
-	for _, ticker := range e.market.ListTickers() {
+	tickers := e.market.ListTickers()
+	e.logger.Info("chart engine started", "tickers", tickers, "interval", e.cfg.TickInterval, "history_limit", e.cfg.HistoryLimit, "depth", e.cfg.OrderbookDepth)
+	for _, ticker := range tickers {
 		go e.runTicker(ctx, ticker)
 	}
 }
@@ -138,13 +144,17 @@ func (e *Engine) Subscribe(ctx context.Context, req SubscriptionRequest) (<-chan
 	e.nextID++
 	ch := make(chan string, 16)
 	e.subscribers[req.Ticker][id] = subscription{Request: req, Ch: ch}
+	subscriberCount := len(e.subscribers[req.Ticker])
+	e.logger.Info("chart subscriber connected", "ticker", req.Ticker, "player_id", req.PlayerID, "subscriber_id", id, "history_limit", req.HistoryLimit, "depth", req.Depth, "subscribers", subscriberCount)
 
 	go func() {
 		<-ctx.Done()
 		e.mu.Lock()
 		delete(e.subscribers[req.Ticker], id)
+		remaining := len(e.subscribers[req.Ticker])
 		close(ch)
 		e.mu.Unlock()
+		e.logger.Info("chart subscriber disconnected", "ticker", req.Ticker, "player_id", req.PlayerID, "subscriber_id", id, "subscribers", remaining)
 	}()
 
 	return ch, nil
@@ -167,6 +177,7 @@ func (e *Engine) runTicker(ctx context.Context, ticker string) {
 func (e *Engine) emitTick(ctx context.Context, ticker string) {
 	snapshot, err := e.market.ChartSnapshot(ticker, e.cfg.OrderbookDepth)
 	if err != nil {
+		e.logger.Warn("capture chart snapshot failed", "ticker", ticker, "error", err)
 		return
 	}
 
@@ -191,6 +202,7 @@ func (e *Engine) emitTick(ctx context.Context, ticker string) {
 		tick := buildTick(snapshot, historyCopy, now, sub.Request.Depth, sub.Request.HistoryLimit)
 		raw, err := json.Marshal(tick)
 		if err != nil {
+			e.logger.Warn("marshal chart tick failed", "ticker", ticker, "player_id", sub.Request.PlayerID, "error", err)
 			continue
 		}
 		select {

@@ -13,6 +13,7 @@ func (e *Engine) SetIntelEngine(engine *intel.Engine) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.intel = engine
+	e.logger.Info("intel engine attached")
 }
 
 func (e *Engine) SubscribePrivate(ctx context.Context, playerID string) <-chan string {
@@ -25,14 +26,17 @@ func (e *Engine) SubscribePrivate(ctx context.Context, playerID string) <-chan s
 	e.nextPrivateID++
 	ch := make(chan string, 32)
 	e.privateSubs[playerID][id] = ch
+	e.logger.Info("private subscriber connected", "player_id", playerID, "subscriber_id", id, "subscribers", len(e.privateSubs[playerID]))
 	go func() {
 		<-ctx.Done()
 		e.mu.Lock()
 		if subs := e.privateSubs[playerID]; subs != nil {
 			delete(subs, id)
-			if len(subs) == 0 {
+			remaining := len(subs)
+			if remaining == 0 {
 				delete(e.privateSubs, playerID)
 			}
+			e.logger.Info("private subscriber disconnected", "player_id", playerID, "subscriber_id", id, "subscribers", remaining)
 		}
 		close(ch)
 		e.mu.Unlock()
@@ -86,15 +90,18 @@ func (e *Engine) notifyPlayerLocked(playerID string, payload string) {
 		default:
 		}
 	}
+	e.logger.Info("private payload delivered", "player_id", playerID, "subscribers", len(e.privateSubs[playerID]))
 }
 
 func (e *Engine) handleIntelCatalog() (string, error) {
 	if e.intel == nil {
 		return "", fmt.Errorf("intel service is not configured")
 	}
+	items := e.intel.Catalog()
+	e.logger.Info("intel catalog requested", "items", len(items))
 	return marshalJSON(map[string]any{
 		"type":  "intel.catalog",
-		"items": e.intel.Catalog(),
+		"items": items,
 	}), nil
 }
 
@@ -133,6 +140,7 @@ func (e *Engine) handleIntelBuy(ctx context.Context, req ExecuteActionRequest) (
 	if err := e.recordPlayerSnapshot(player); err != nil {
 		return "", err
 	}
+	e.logger.Info("intel purchased", "player_id", player.PlayerID, "intel_id", payload.IntelID, "cost", result.Cost)
 
 	return marshalJSON(map[string]any{
 		"type":      "intel.buy.result",

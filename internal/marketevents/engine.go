@@ -3,6 +3,7 @@ package marketevents
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"regexp"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/aeza/ssh-arena/internal/exchange"
 	"github.com/aeza/ssh-arena/internal/jsonfile"
+	"github.com/aeza/ssh-arena/internal/logx"
 )
 
 type Definition struct {
@@ -67,6 +69,7 @@ type Engine struct {
 	defs    []preparedDefinition
 	planned *PlannedEvent
 	nextSeq int64
+	logger  *slog.Logger
 }
 
 type Market interface {
@@ -130,13 +133,16 @@ func NewEngine(cfg Config, defs []Definition, market Market, scheduler PreviewSc
 		schedule: scheduler,
 		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 		defs:     prepared,
+		logger:   logx.L("random-events"),
 	}, nil
 }
 
 func (e *Engine) Start(ctx context.Context) {
 	if len(e.defs) == 0 {
+		e.logger.Warn("random events engine disabled: no definitions")
 		return
 	}
+	e.logger.Info("random events engine started", "definitions", len(e.defs), "interval", e.cfg.Interval)
 	go e.run(ctx)
 }
 
@@ -191,6 +197,7 @@ func (e *Engine) step(ctx context.Context, now time.Time) {
 	e.mu.Unlock()
 
 	for _, planned := range plans {
+		e.logger.Info("random event scheduled", "event_id", planned.ID, "name", planned.EventName, "symbol", planned.Symbol, "global", planned.Global, "multiplier_pct", planned.MultiplierPct, "scheduled_at", planned.ScheduledAt)
 		if e.schedule != nil {
 			e.schedule.ScheduleNextRandomEvent(ctx, planned)
 		}
@@ -201,7 +208,7 @@ func (e *Engine) step(ctx context.Context, now time.Time) {
 }
 
 func (e *Engine) fire(ctx context.Context, planned PlannedEvent) {
-	_, _ = e.market.TriggerMarketEvent(ctx, exchange.EventShockInput{
+	if _, err := e.market.TriggerMarketEvent(ctx, exchange.EventShockInput{
 		Kind:          planned.Kind,
 		EventName:     planned.EventName,
 		Message:       planned.Message,
@@ -210,7 +217,11 @@ func (e *Engine) fire(ctx context.Context, planned PlannedEvent) {
 		MultiplierPct: planned.MultiplierPct,
 		Duration:      planned.Duration,
 		OccurredAt:    planned.ScheduledAt,
-	})
+	}); err != nil {
+		e.logger.Warn("random event failed", "event_id", planned.ID, "name", planned.EventName, "error", err)
+		return
+	}
+	e.logger.Info("random event fired", "event_id", planned.ID, "name", planned.EventName, "symbol", planned.Symbol, "global", planned.Global, "multiplier_pct", planned.MultiplierPct)
 }
 
 func (e *Engine) planLocked(now time.Time) *PlannedEvent {

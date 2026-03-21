@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"net"
 	"os"
 	"time"
@@ -22,51 +22,53 @@ import (
 	"github.com/aeza/ssh-arena/internal/grpcapi"
 	"github.com/aeza/ssh-arena/internal/grpcjson"
 	"github.com/aeza/ssh-arena/internal/intel"
+	"github.com/aeza/ssh-arena/internal/logx"
 	"github.com/aeza/ssh-arena/internal/marketevents"
 	"github.com/aeza/ssh-arena/internal/roles"
 	"github.com/aeza/ssh-arena/internal/state"
 )
 
 func main() {
+	logger := logx.L("cmd.grpc-game")
 	addr := envOr("GRPC_LISTEN_ADDR", ":9090")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	runtimeConfig, err := config.LoadRuntimeConfig("config.yaml")
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load runtime config", err)
 	}
 	tickers, err := exchange.LoadTickers("events/stocks.json")
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load tickers", err)
 	}
 	roleConfig, err := roles.LoadConfig("config/roles.json")
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load role config", err)
 	}
 	eventDefs, err := marketevents.LoadDefinitions(runtimeConfig.RandomEventsPath)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load random events", err)
 	}
 	intelDefs, err := intel.LoadDefinitions(runtimeConfig.IntelEventsPath)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load intel feeds", err)
 	}
 	playerStore, err := state.LoadPlayerStore(runtimeConfig.PlayerStatePath)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load player store", err)
 	}
 	tradeStore, err := state.LoadTradeStore(runtimeConfig.TradeHistoryPath, 100000)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load trade store", err)
 	}
 	performanceStore, err := state.LoadPerformanceStore(runtimeConfig.PerformanceHistoryPath, 200000)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load performance store", err)
 	}
 	chatStore, err := state.LoadChatStore(runtimeConfig.ChatHistoryPath, 20000)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "load chat store", err)
 	}
 
 	chatService := chat.NewService(128, chatStore)
@@ -74,6 +76,9 @@ func main() {
 	if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
 		client := redis.NewClient(&redis.Options{Addr: redisAddr})
 		cache = exchange.NewRedisCache(client)
+		logger.Info("redis cache enabled", "addr", redisAddr)
+	} else {
+		logger.Info("redis cache disabled")
 	}
 	exchangeService := exchange.NewService(tickers, chatService, cache)
 	allocator := roles.NewAllocator(roleConfig)
@@ -89,7 +94,7 @@ func main() {
 		Interval: time.Duration(runtimeConfig.IntelEventIntervalSecs) * time.Second,
 	}, intelDefs, exchangeService, gameEngine)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "create intel engine", err)
 	}
 	gameEngine.SetIntelEngine(intelEngine)
 
@@ -97,10 +102,9 @@ func main() {
 		Interval: time.Duration(runtimeConfig.RandomEventIntervalSecs) * time.Second,
 	}, eventDefs, exchangeService, intelEngine)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "create random events engine", err)
 	}
 	randomEvents.Start(ctx)
-
 	intelEngine.Start(ctx)
 
 	api := grpcapi.New(gameEngine)
@@ -108,7 +112,7 @@ func main() {
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "listen grpc", err)
 	}
 
 	server := grpc.NewServer(grpc.ForceServerCodec(grpcjson.Codec{}))
@@ -120,11 +124,29 @@ func main() {
 	gamev1.RegisterChatServiceServer(server, api)
 	reflection.Register(server)
 
-	log.Printf("grpc game service listening on %s", addr)
-	log.Printf("exchange core ready: tickers=%d chart_interval=%ds chart_history=%d chart_depth=%d random_event_interval=%ds random_events=%d intel_interval=%ds intel_defs=%d cache_enabled=%t trade_history=%s performance_history=%s chat_history=%s", len(tickers), runtimeConfig.ChartTickIntervalSeconds, runtimeConfig.ChartHistoryPoints, runtimeConfig.ChartOrderbookDepth, runtimeConfig.RandomEventIntervalSecs, len(eventDefs), runtimeConfig.IntelEventIntervalSecs, len(intelDefs), cache != nil, runtimeConfig.TradeHistoryPath, runtimeConfig.PerformanceHistoryPath, runtimeConfig.ChatHistoryPath)
+	logger.Info("grpc game service listening", "addr", addr)
+	logger.Info("exchange core ready",
+		"tickers", len(tickers),
+		"chart_interval", fmt.Sprintf("%ds", runtimeConfig.ChartTickIntervalSeconds),
+		"chart_history", runtimeConfig.ChartHistoryPoints,
+		"chart_depth", runtimeConfig.ChartOrderbookDepth,
+		"random_event_interval", fmt.Sprintf("%ds", runtimeConfig.RandomEventIntervalSecs),
+		"random_events", len(eventDefs),
+		"intel_interval", fmt.Sprintf("%ds", runtimeConfig.IntelEventIntervalSecs),
+		"intel_defs", len(intelDefs),
+		"cache_enabled", cache != nil,
+		"trade_history", runtimeConfig.TradeHistoryPath,
+		"performance_history", runtimeConfig.PerformanceHistoryPath,
+		"chat_history", runtimeConfig.ChatHistoryPath,
+	)
 	if err := server.Serve(lis); err != nil {
-		log.Fatal(err)
+		fatalErr(logger, "serve grpc", err)
 	}
+}
+
+func fatalErr(logger interface{ Error(string, ...any) }, message string, err error) {
+	logger.Error(message, "error", err)
+	os.Exit(1)
 }
 
 func envOr(key, fallback string) string {

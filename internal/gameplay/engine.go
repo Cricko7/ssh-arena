@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/aeza/ssh-arena/internal/chat"
 	"github.com/aeza/ssh-arena/internal/exchange"
 	"github.com/aeza/ssh-arena/internal/intel"
+	"github.com/aeza/ssh-arena/internal/logx"
 	"github.com/aeza/ssh-arena/internal/orderbook"
 	"github.com/aeza/ssh-arena/internal/roles"
 	"github.com/aeza/ssh-arena/internal/state"
@@ -37,6 +39,7 @@ type Engine struct {
 	privateHistory      map[string][]string
 	privateHistoryLimit int
 	nextPrivateID       int
+	logger              *slog.Logger
 }
 
 type openOrder struct {
@@ -114,6 +117,7 @@ func NewEngine(players *state.PlayerStore, tradeHistory *state.TradeStore, perfo
 		privateSubs:         make(map[string]map[int]chan string),
 		privateHistory:      make(map[string][]string),
 		privateHistoryLimit: 64,
+		logger:              logx.L("gameplay"),
 	}
 }
 
@@ -133,6 +137,7 @@ func (e *Engine) EnsurePlayer(_ context.Context, req EnsurePlayerRequest) (Ensur
 		if err := e.recordPlayerSnapshot(player); err != nil {
 			return EnsurePlayerResponse{}, err
 		}
+		e.logger.Info("player login", "username", req.Username, "player_id", player.PlayerID, "role", player.Role, "created", false, "remote_addr", req.RemoteAddr)
 		return EnsurePlayerResponse{Player: player, BootstrapJSON: bootstrapJSON}, nil
 	}
 
@@ -158,6 +163,7 @@ func (e *Engine) EnsurePlayer(_ context.Context, req EnsurePlayerRequest) (Ensur
 	if err := e.recordPlayerSnapshot(player); err != nil {
 		return EnsurePlayerResponse{}, err
 	}
+	e.logger.Info("player created", "username", req.Username, "player_id", player.PlayerID, "role", player.Role, "cash", player.Cash, "remote_addr", req.RemoteAddr)
 	return EnsurePlayerResponse{Player: player, Created: true, BootstrapJSON: bootstrapJSON}, nil
 }
 
@@ -165,34 +171,46 @@ func (e *Engine) ExecuteAction(ctx context.Context, req ExecuteActionRequest) (s
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	var (
+		response string
+		err      error
+	)
+
 	switch req.ActionID {
 	case "place_order", "exchange.place_order":
-		return e.handlePlaceOrder(ctx, req)
+		response, err = e.handlePlaceOrder(ctx, req)
 	case "cancel_order", "exchange.cancel_order":
-		return e.handleCancelOrder(ctx, req)
+		response, err = e.handleCancelOrder(ctx, req)
 	case "portfolio.get", "player.portfolio", "portfolio":
-		player, err := e.requirePlayer(req.PlayerID)
-		if err != nil {
-			return "", err
+		var player state.Player
+		player, err = e.requirePlayer(req.PlayerID)
+		if err == nil {
+			response = marshalJSON(e.snapshotPlayer(player))
 		}
-		return marshalJSON(e.snapshotPlayer(player)), nil
 	case "chat.send", "send_chat_message":
-		return e.handleSendChat(ctx, req)
+		response, err = e.handleSendChat(ctx, req)
 	case "market.snapshot":
-		return e.handleMarketSnapshot(req)
+		response, err = e.handleMarketSnapshot(req)
 	case "market.catalog", "market.list":
-		return e.handleMarketCatalog(), nil
+		response = e.handleMarketCatalog()
 	case "trade.history", "trades.history":
-		return e.handleTradeHistory(req)
+		response, err = e.handleTradeHistory(req)
 	case "stats.leaderboard", "leaderboard":
-		return e.handleLeaderboard(req)
+		response, err = e.handleLeaderboard(req)
 	case "intel.catalog", "intel.list":
-		return e.handleIntelCatalog()
+		response, err = e.handleIntelCatalog()
 	case "intel.buy":
-		return e.handleIntelBuy(ctx, req)
+		response, err = e.handleIntelBuy(ctx, req)
 	default:
-		return "", fmt.Errorf("unsupported action %q", req.ActionID)
+		err = fmt.Errorf("unsupported action %q", req.ActionID)
 	}
+
+	if err != nil {
+		e.logger.Warn("action failed", "request_id", req.RequestID, "player_id", req.PlayerID, "action_id", req.ActionID, "error", err)
+		return "", err
+	}
+	e.logger.Info("action handled", "request_id", req.RequestID, "player_id", req.PlayerID, "action_id", req.ActionID)
+	return response, nil
 }
 
 func (e *Engine) MarketFeed(ctx context.Context) <-chan string {
@@ -357,6 +375,7 @@ func (e *Engine) handlePlaceOrder(ctx context.Context, req ExecuteActionRequest)
 		return "", err
 	}
 
+	e.logger.Info("order placed", "request_id", req.RequestID, "player_id", player.PlayerID, "symbol", payload.Symbol, "side", payload.Side, "type", payload.Type, "quantity", payload.Quantity, "price", payload.Price, "trades", len(result.Trades), "resting", result.Resting != nil)
 	portfolio := e.snapshotPlayer(*touchedPlayers[player.PlayerID])
 	response := map[string]any{
 		"type":      "action.place_order.result",
@@ -394,6 +413,7 @@ func (e *Engine) handleCancelOrder(ctx context.Context, req ExecuteActionRequest
 	if err := e.players.Upsert(player); err != nil {
 		return "", err
 	}
+	e.logger.Info("order cancelled", "request_id", req.RequestID, "player_id", player.PlayerID, "order_id", payload.OrderID, "symbol", payload.Symbol)
 	response := map[string]any{
 		"type":      "action.cancel_order.result",
 		"market":    decodeJSON(marketJSON),

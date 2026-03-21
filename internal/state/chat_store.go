@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aeza/ssh-arena/internal/jsonfile"
+	"github.com/aeza/ssh-arena/internal/logx"
 )
 
 type ChatMessage struct {
@@ -39,6 +41,7 @@ type ChatStore struct {
 	path       string
 	maxRecords int
 	messages   []ChatMessage
+	logger     *slog.Logger
 }
 
 func LoadChatStore(path string, maxRecords int) (*ChatStore, error) {
@@ -49,10 +52,12 @@ func LoadChatStore(path string, maxRecords int) (*ChatStore, error) {
 		path:       path,
 		maxRecords: maxRecords,
 		messages:   make([]ChatMessage, 0),
+		logger:     logx.L("state.chat"),
 	}
 	if err := store.load(); err != nil {
 		return nil, err
 	}
+	store.logger.Info("chat store ready", "path", path, "records", len(store.messages), "max_records", maxRecords)
 	return store, nil
 }
 
@@ -60,11 +65,25 @@ func (s *ChatStore) load() error {
 	var snap chatSnapshot
 	if err := jsonfile.Read(s.path, &snap); err != nil {
 		if os.IsNotExist(err) {
+			s.logger.Info("chat store file not found", "path", s.path)
 			return nil
 		}
 		return fmt.Errorf("read chat store: %w", err)
 	}
-	s.messages = append(s.messages[:0], snap.Messages...)
+	filtered := make([]ChatMessage, 0, len(snap.Messages))
+	removed := 0
+	for _, message := range snap.Messages {
+		if message.Type == "system.event" {
+			removed++
+			continue
+		}
+		filtered = append(filtered, message)
+	}
+	s.messages = append(s.messages[:0], filtered...)
+	if removed > 0 {
+		s.logger.Info("filtered deprecated system.event chat records", "removed", removed, "path", s.path)
+		return s.persistLocked()
+	}
 	return nil
 }
 
@@ -91,6 +110,9 @@ func (s *ChatStore) Query(query ChatQuery) []ChatMessage {
 	out := make([]ChatMessage, 0, limit)
 	for i := len(s.messages) - 1; i >= 0; i-- {
 		record := s.messages[i]
+		if record.Type == "system.event" {
+			continue
+		}
 		if query.Channel != "" && record.Channel != query.Channel {
 			continue
 		}
