@@ -39,6 +39,8 @@ type Engine struct {
 	privateHistory      map[string][]string
 	privateHistoryLimit int
 	nextPrivateID       int
+	bootstrapTokens     map[string]bootstrapGrant
+	bootstrapTokenTTL   time.Duration
 	logger              *slog.Logger
 }
 
@@ -49,11 +51,18 @@ const (
 )
 
 const rapidFlipWindow = 5 * time.Minute
+const bootstrapTokenTTL = 2 * time.Minute
 
 type openOrder struct {
 	Order            orderbook.Order
 	ReservedCash     int64
 	ReservedQuantity int64
+}
+
+type bootstrapGrant struct {
+	PlayerID  string
+	Username  string
+	ExpiresAt time.Time
 }
 
 type TradeRulesSnapshot struct {
@@ -142,6 +151,8 @@ func NewEngine(players *state.PlayerStore, tradeHistory *state.TradeStore, perfo
 		privateSubs:         make(map[string]map[int]chan string),
 		privateHistory:      make(map[string][]string),
 		privateHistoryLimit: 64,
+		bootstrapTokens:     make(map[string]bootstrapGrant),
+		bootstrapTokenTTL:   bootstrapTokenTTL,
 		logger:              logx.L("gameplay"),
 	}
 }
@@ -155,7 +166,8 @@ func (e *Engine) EnsurePlayer(_ context.Context, req EnsurePlayerRequest) (Ensur
 		if err := e.players.Upsert(player); err != nil {
 			return EnsurePlayerResponse{}, err
 		}
-		bootstrapJSON, err := e.bootstrapJSON(player)
+		bootstrapToken, expiresAt := e.issueBootstrapToken(player)
+		bootstrapJSON, err := e.bootstrapJSON(player, bootstrapToken, expiresAt)
 		if err != nil {
 			return EnsurePlayerResponse{}, err
 		}
@@ -181,7 +193,8 @@ func (e *Engine) EnsurePlayer(_ context.Context, req EnsurePlayerRequest) (Ensur
 	if err := e.players.Upsert(player); err != nil {
 		return EnsurePlayerResponse{}, err
 	}
-	bootstrapJSON, err := e.bootstrapJSON(player)
+	bootstrapToken, expiresAt := e.issueBootstrapToken(player)
+	bootstrapJSON, err := e.bootstrapJSON(player, bootstrapToken, expiresAt)
 	if err != nil {
 		return EnsurePlayerResponse{}, err
 	}
@@ -218,6 +231,8 @@ func (e *Engine) ExecuteAction(ctx context.Context, req ExecuteActionRequest) (s
 		response, err = e.handleMarketSnapshot(req)
 	case "market.catalog", "market.list":
 		response = e.handleMarketCatalog()
+	case "bootstrap.exchange_token":
+		response, err = e.handleBootstrapExchange(req)
 	case "trade.history", "trades.history":
 		response, err = e.handleTradeHistory(req)
 	case "stats.leaderboard", "leaderboard":
@@ -772,16 +787,18 @@ func (e *Engine) snapshotPlayer(player state.Player) PortfolioSnapshot {
 	}
 }
 
-func (e *Engine) bootstrapJSON(player state.Player) (string, error) {
+func (e *Engine) bootstrapJSON(player state.Player, bootstrapToken string, expiresAt time.Time) (string, error) {
 	payload := map[string]any{
-		"type":       "bootstrap",
-		"player_id":  player.PlayerID,
-		"username":   player.Username,
-		"role":       player.Role,
-		"cash":       player.Cash,
-		"portfolio":  player.Portfolio,
-		"created_at": player.CreatedAt,
-		"last_login": player.LastLoginAt,
+		"type":                       "bootstrap",
+		"player_id":                  player.PlayerID,
+		"username":                   player.Username,
+		"role":                       player.Role,
+		"cash":                       player.Cash,
+		"portfolio":                  player.Portfolio,
+		"created_at":                 player.CreatedAt,
+		"last_login":                 player.LastLoginAt,
+		"bootstrap_token":            bootstrapToken,
+		"bootstrap_token_expires_at": expiresAt,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -790,6 +807,59 @@ func (e *Engine) bootstrapJSON(player state.Player) (string, error) {
 	return string(raw), nil
 }
 
+func (e *Engine) issueBootstrapToken(player state.Player) (string, time.Time) {
+	now := time.Now().UTC()
+	expiresAt := now.Add(e.bootstrapTokenTTL)
+	for token, grant := range e.bootstrapTokens {
+		if !grant.ExpiresAt.After(now) {
+			delete(e.bootstrapTokens, token)
+		}
+	}
+	token := uuid.NewString()
+	e.bootstrapTokens[token] = bootstrapGrant{PlayerID: player.PlayerID, Username: player.Username, ExpiresAt: expiresAt}
+	e.logger.Info("bootstrap token issued", "player_id", player.PlayerID, "username", player.Username, "expires_at", expiresAt)
+	return token, expiresAt
+}
+
+func (e *Engine) consumeBootstrapToken(token string) (bootstrapGrant, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return bootstrapGrant{}, fmt.Errorf("bootstrap token is required")
+	}
+	now := time.Now().UTC()
+	grant, ok := e.bootstrapTokens[token]
+	if !ok {
+		return bootstrapGrant{}, fmt.Errorf("bootstrap token is invalid or already used")
+	}
+	delete(e.bootstrapTokens, token)
+	if !grant.ExpiresAt.After(now) {
+		return bootstrapGrant{}, fmt.Errorf("bootstrap token expired")
+	}
+	return grant, nil
+}
+
+func (e *Engine) handleBootstrapExchange(req ExecuteActionRequest) (string, error) {
+	var payload struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		return "", fmt.Errorf("decode bootstrap token payload: %w", err)
+	}
+	grant, err := e.consumeBootstrapToken(payload.Token)
+	if err != nil {
+		return "", err
+	}
+	player, err := e.requirePlayer(grant.PlayerID)
+	if err != nil {
+		return "", err
+	}
+	return marshalJSON(map[string]any{
+		"type":      "bootstrap.exchange_token",
+		"player_id": player.PlayerID,
+		"username":  player.Username,
+		"role":      player.Role,
+	}), nil
+}
 func tradingRulesSnapshot() TradeRulesSnapshot {
 	return TradeRulesSnapshot{
 		ExchangeFeeBps:          exchangeFeeBps,

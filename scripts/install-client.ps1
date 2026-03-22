@@ -1,6 +1,7 @@
 #!/usr/bin/env pwsh
 param(
-  [string]$InstallDir = "$HOME\.ssh-arena\bin"
+  [string]$InstallDir = "$HOME\.ssh-arena\bin",
+  [string[]]$ClientArgs = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,4 +26,9 @@ go build -o $binaryPath ./cmd/game-client
 Pop-Location
 
 Write-Host "Installed ssh-arena client to $binaryPath"
-Write-Host "Run it with: & '$binaryPath'"
+if ($ClientArgs.Count -gt 0) {
+  Write-Host "Launching: $binaryPath $($ClientArgs -join ' ')"
+  & $binaryPath @ClientArgs
+} else {
+  Write-Host "Run it with: & '$binaryPath'"
+}

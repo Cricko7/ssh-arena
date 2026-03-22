@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"golang.org/x/term"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -29,19 +31,26 @@ import (
 )
 
 type config struct {
-	SSHAddr      string
-	Username     string
-	Password     string
-	GRPCAddr     string
-	PlayerID     string
-	ProfilePath  string
-	ResetProfile bool
-	Symbols      []string
-	Initial      string
-	HistoryLimit int
-	Depth        int
+	SSHAddr        string
+	Username       string
+	Password       string
+	BootstrapToken string
+	GRPCAddr       string
+	PlayerID       string
+	ProfilePath    string
+	ResetProfile   bool
+	Symbols        []string
+	Initial        string
+	HistoryLimit   int
+	Depth          int
 }
 
+type bootstrapTokenExchange struct {
+	Type     string `json:"type"`
+	PlayerID string `json:"player_id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+}
 type chartTickMsg struct {
 	tick charting.PriceChartTick
 }
@@ -413,12 +422,59 @@ func main() {
 	clientLogger.Info("client shutdown complete", "player_id", cfg.PlayerID)
 }
 
+func promptBootstrapCredentials(cfg *config) error {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return fmt.Errorf("no saved profile found; run once with --user and --password, or start the client from an interactive terminal")
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("No saved profile found. Starting first-time SSH bootstrap.")
+	defaultAddr := strings.TrimSpace(cfg.SSHAddr)
+	if defaultAddr == "" {
+		defaultAddr = "localhost:2222"
+	}
+	fmt.Printf("Server SSH address [%s]: ", defaultAddr)
+	sshAddr, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read ssh address: %w", err)
+	}
+	sshAddr = strings.TrimSpace(sshAddr)
+	if sshAddr == "" {
+		cfg.SSHAddr = defaultAddr
+	} else {
+		cfg.SSHAddr = sshAddr
+	}
+	if strings.TrimSpace(cfg.Username) == "" {
+		fmt.Printf("SSH username: ")
+		username, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read ssh username: %w", err)
+		}
+		cfg.Username = strings.TrimSpace(username)
+	}
+	if cfg.Password == "" {
+		fmt.Printf("SSH password: ")
+		password, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return fmt.Errorf("read ssh password: %w", err)
+		}
+		cfg.Password = strings.TrimSpace(string(password))
+	}
+	if cfg.Username == "" || cfg.Password == "" {
+		return fmt.Errorf("ssh username and password are required for first bootstrap")
+	}
+	clientLogger.Info("interactive bootstrap credentials captured", "ssh_addr", cfg.SSHAddr, "username", cfg.Username)
+	return nil
+}
+
 func resolveConfig() (config, string, error) {
 	cfg := config{}
 	symbolsFlag := flag.String("symbols", "", "comma-separated tickers to subscribe")
 	flag.StringVar(&cfg.SSHAddr, "ssh", "localhost:2222", "SSH bootstrap address")
 	flag.StringVar(&cfg.Username, "user", "", "SSH username for bootstrap")
 	flag.StringVar(&cfg.Password, "password", "", "SSH password for bootstrap")
+	flag.StringVar(&cfg.BootstrapToken, "bootstrap-token", "", "one-time bootstrap token from SSH gateway")
 	flag.StringVar(&cfg.GRPCAddr, "grpc", "", "gRPC address override")
 	flag.StringVar(&cfg.PlayerID, "player-id", "", "existing player ID; skip SSH bootstrap when set")
 	flag.StringVar(&cfg.ProfilePath, "profile", "", "path to local client profile")
@@ -472,34 +528,60 @@ func resolveConfig() (config, string, error) {
 	defer cancel()
 
 	if cfg.PlayerID == "" {
-		if cfg.Username == "" || cfg.Password == "" {
-			return config{}, "", fmt.Errorf("no saved profile found; run once with --user and --password to bootstrap over SSH")
-		}
-		clientLogger.Info("starting bootstrap flow", "ssh_addr", cfg.SSHAddr, "username", cfg.Username)
-		bootstrap, bootstrapErr := client.BootstrapViaSSH(ctx, cfg.SSHAddr, cfg.Username, cfg.Password)
-		if bootstrapErr != nil {
-			clientLogger.Error("bootstrap flow failed", "ssh_addr", cfg.SSHAddr, "username", cfg.Username, "error", bootstrapErr)
-			return config{}, "", bootstrapErr
-		}
-		cfg.PlayerID = bootstrap.PlayerID
-		if cfg.GRPCAddr == "" {
-			cfg.GRPCAddr = bootstrap.GRPCEndpoint
-		}
-		if cfg.Username == "" {
-			cfg.Username = bootstrap.Username
-		}
-		playerLabel = fmt.Sprintf("%s (%s) %s", bootstrap.Username, bootstrap.Role, bootstrap.PlayerID)
-		portfolioSymbols := make([]string, 0, len(bootstrap.Portfolio))
-		for symbol := range bootstrap.Portfolio {
-			portfolioSymbols = append(portfolioSymbols, symbol)
-		}
-		serverSymbols, fetchErr := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
-		if fetchErr != nil {
-			clientLogger.Warn("fetch market catalog after bootstrap failed", "error", fetchErr)
+		if cfg.BootstrapToken != "" {
+			if cfg.GRPCAddr == "" {
+				cfg.GRPCAddr = "localhost:9090"
+			}
+			clientLogger.Info("starting bootstrap token exchange", "grpc_addr", cfg.GRPCAddr)
+			exchange, exchangeErr := exchangeBootstrapToken(cfg)
+			if exchangeErr != nil {
+				clientLogger.Error("bootstrap token exchange failed", "grpc_addr", cfg.GRPCAddr, "error", exchangeErr)
+				return config{}, "", exchangeErr
+			}
+			cfg.PlayerID = exchange.PlayerID
+			if cfg.Username == "" {
+				cfg.Username = exchange.Username
+			}
+			playerLabel = fmt.Sprintf("%s (%s) %s", exchange.Username, exchange.Role, exchange.PlayerID)
+			serverSymbols, fetchErr := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
+			if fetchErr != nil {
+				clientLogger.Warn("fetch market catalog after token exchange failed", "error", fetchErr)
+			} else {
+				clientLogger.Info("market catalog fetched after token exchange", "symbols", len(serverSymbols))
+			}
+			cfg.Symbols = normalizeSymbols(*symbolsFlag, mergeFallback(profile.Symbols, serverSymbols))
 		} else {
-			clientLogger.Info("market catalog fetched after bootstrap", "symbols", len(serverSymbols))
+			if cfg.Username == "" || cfg.Password == "" {
+				if promptErr := promptBootstrapCredentials(&cfg); promptErr != nil {
+					return config{}, "", promptErr
+				}
+			}
+			clientLogger.Info("starting bootstrap flow", "ssh_addr", cfg.SSHAddr, "username", cfg.Username)
+			bootstrap, bootstrapErr := client.BootstrapViaSSH(ctx, cfg.SSHAddr, cfg.Username, cfg.Password)
+			if bootstrapErr != nil {
+				clientLogger.Error("bootstrap flow failed", "ssh_addr", cfg.SSHAddr, "username", cfg.Username, "error", bootstrapErr)
+				return config{}, "", bootstrapErr
+			}
+			cfg.PlayerID = bootstrap.PlayerID
+			if cfg.GRPCAddr == "" {
+				cfg.GRPCAddr = bootstrap.GRPCEndpoint
+			}
+			if cfg.Username == "" {
+				cfg.Username = bootstrap.Username
+			}
+			playerLabel = fmt.Sprintf("%s (%s) %s", bootstrap.Username, bootstrap.Role, bootstrap.PlayerID)
+			portfolioSymbols := make([]string, 0, len(bootstrap.Portfolio))
+			for symbol := range bootstrap.Portfolio {
+				portfolioSymbols = append(portfolioSymbols, symbol)
+			}
+			serverSymbols, fetchErr := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
+			if fetchErr != nil {
+				clientLogger.Warn("fetch market catalog after bootstrap failed", "error", fetchErr)
+			} else {
+				clientLogger.Info("market catalog fetched after bootstrap", "symbols", len(serverSymbols))
+			}
+			cfg.Symbols = normalizeSymbols(*symbolsFlag, mergeFallback(mergeFallback(profile.Symbols, portfolioSymbols), serverSymbols))
 		}
-		cfg.Symbols = normalizeSymbols(*symbolsFlag, mergeFallback(mergeFallback(profile.Symbols, portfolioSymbols), serverSymbols))
 	} else {
 		if cfg.GRPCAddr == "" {
 			cfg.GRPCAddr = "localhost:9090"
@@ -1758,6 +1840,20 @@ func mergeFallback(primary []string, secondary []string) []string {
 	return out
 }
 
+func exchangeBootstrapToken(cfg config) (bootstrapTokenExchange, error) {
+	response, err := executeActionJSON(config{GRPCAddr: cfg.GRPCAddr}, "bootstrap.exchange_token", map[string]any{"token": cfg.BootstrapToken})
+	if err != nil {
+		return bootstrapTokenExchange{}, err
+	}
+	var payload bootstrapTokenExchange
+	if err := json.Unmarshal([]byte(response), &payload); err != nil {
+		return bootstrapTokenExchange{}, fmt.Errorf("decode bootstrap token exchange: %w", err)
+	}
+	if payload.Type != "bootstrap.exchange_token" || payload.PlayerID == "" {
+		return bootstrapTokenExchange{}, fmt.Errorf("unexpected bootstrap token exchange payload %q", payload.Type)
+	}
+	return payload, nil
+}
 func fetchMarketSymbols(cfg config) ([]string, error) {
 	response, err := executeActionJSON(cfg, "market.catalog", map[string]any{})
 	if err != nil {
@@ -1896,7 +1992,3 @@ func sampleHistory(history []charting.HistoryPoint, target int) []charting.Histo
 	}
 	return out
 }
-
-
-
-

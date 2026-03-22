@@ -22,6 +22,48 @@ import (
 	"github.com/aeza/ssh-arena/internal/state"
 )
 
+func TestBootstrapTokenExchangeViaGRPC(t *testing.T) {
+	ctx := context.Background()
+	conn, clients, _, cleanup := newIntegrationHarness(t)
+	defer cleanup()
+	defer conn.Close()
+
+	resp := ensurePlayer(t, ctx, clients.accounts, "token-user")
+	var bootstrap struct {
+		Type           string `json:"type"`
+		PlayerID       string `json:"player_id"`
+		BootstrapToken string `json:"bootstrap_token"`
+	}
+	mustDecodeJSON(t, resp.BootstrapJSON, &bootstrap)
+	if bootstrap.Type != "bootstrap" || bootstrap.PlayerID == "" || bootstrap.BootstrapToken == "" {
+		t.Fatalf("unexpected bootstrap payload: %s", resp.BootstrapJSON)
+	}
+
+	exchangeResp := executeAction(t, ctx, clients.game, "", "token-1", "bootstrap.exchange_token", fmt.Sprintf(`{"token":%q}`, bootstrap.BootstrapToken))
+	var exchange struct {
+		Type     string `json:"type"`
+		PlayerID string `json:"player_id"`
+		Username string `json:"username"`
+		Role     string `json:"role"`
+	}
+	mustDecodeJSON(t, exchangeResp.ResponseJSON, &exchange)
+	if exchange.Type != "bootstrap.exchange_token" || exchange.PlayerID != bootstrap.PlayerID || exchange.Username != "token-user" {
+		t.Fatalf("unexpected exchange payload: %s", exchangeResp.ResponseJSON)
+	}
+
+	reuseResp, err := clients.game.ExecuteAction(ctx, &gamev1.ActionRequest{
+		RequestID:   "token-2",
+		PlayerID:    "",
+		ActionID:    "bootstrap.exchange_token",
+		PayloadJSON: fmt.Sprintf(`{"token":%q}`, bootstrap.BootstrapToken),
+	})
+	if err != nil {
+		t.Fatalf("reuse bootstrap token: %v", err)
+	}
+	if reuseResp.Status != "error" {
+		t.Fatalf("expected reused bootstrap token to fail, got %s", reuseResp.ResponseJSON)
+	}
+}
 func TestMarketCatalogViaGRPC(t *testing.T) {
 	ctx := context.Background()
 	conn, clients, _, cleanup := newIntegrationHarness(t)

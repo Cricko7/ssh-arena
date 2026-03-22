@@ -24,4 +24,8 @@ cd "$REPO_ROOT"
 GOCACHE="$TMP_ROOT/gocache" go build -o "$BINARY_PATH" ./cmd/game-client
 
 printf 'Installed ssh-arena client to %s\n' "$BINARY_PATH"
+if [ "$#" -gt 0 ]; then
+  printf 'Launching: %s %s\n' "$BINARY_PATH" "$*"
+  exec "$BINARY_PATH" "$@"
+fi
 printf 'Run it with: %s\n' "$BINARY_PATH"
