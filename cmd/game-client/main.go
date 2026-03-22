@@ -63,17 +63,26 @@ type intelCatalogItem struct {
 	Price       int64  `json:"price"`
 }
 
+type tradeRulesSnapshot struct {
+	ExchangeFeeBps          int64 `json:"exchange_fee_bps"`
+	MarketOrderSurchargeBps int64 `json:"market_order_surcharge_bps"`
+	RapidFlipTaxBps         int64 `json:"rapid_flip_tax_bps"`
+	RapidFlipWindowSeconds  int64 `json:"rapid_flip_window_seconds"`
+}
+
 type portfolioSnapshot struct {
-	Type           string           `json:"type"`
-	PlayerID       string           `json:"player_id"`
-	Username       string           `json:"username"`
-	Role           string           `json:"role"`
-	Cash           int64            `json:"cash"`
-	ReservedCash   int64            `json:"reserved_cash"`
-	AvailableCash  int64            `json:"available_cash"`
-	Portfolio      map[string]int64 `json:"portfolio"`
-	ReservedStocks map[string]int64 `json:"reserved_stocks"`
-	AvailableStock map[string]int64 `json:"available_stock"`
+	Type           string             `json:"type"`
+	PlayerID       string             `json:"player_id"`
+	Username       string             `json:"username"`
+	Role           string             `json:"role"`
+	Cash           int64              `json:"cash"`
+	ReservedCash   int64              `json:"reserved_cash"`
+	AvailableCash  int64              `json:"available_cash"`
+	Portfolio      map[string]int64   `json:"portfolio"`
+	ReservedStocks map[string]int64   `json:"reserved_stocks"`
+	AvailableStock map[string]int64   `json:"available_stock"`
+	FreshStock     map[string]int64   `json:"fresh_stock"`
+	Rules          tradeRulesSnapshot `json:"rules"`
 }
 
 type orderTicket struct {
@@ -114,9 +123,11 @@ type uiState struct {
 	orderbookRects []orderbookRect
 	portfolio      portfolioSnapshot
 	hasPortfolio   bool
+	rules          tradeRulesSnapshot
 	ticket         orderTicket
 	chartZoom      int
 	chartOffset    int
+	chartPlotWidth int
 	timeframe      int
 	chatRect       tickerRect
 	chatNameRects  []chatNameRect
@@ -848,11 +859,23 @@ func (c *actionClientCache) reset(addr string) {
 	c.addr = ""
 }
 func applyActionResponse(state *uiState, msg actionResponseMsg) {
+	if msg.actionID == "market.rules" {
+		var payload struct {
+			Type  string             `json:"type"`
+			Rules tradeRulesSnapshot `json:"rules"`
+		}
+		if err := json.Unmarshal([]byte(msg.json), &payload); err == nil && payload.Type == "market.rules" {
+			state.rules = payload.Rules
+			state.status = "market rules loaded"
+			return
+		}
+	}
 	if msg.actionID == "portfolio.get" {
 		var snapshot portfolioSnapshot
 		if err := json.Unmarshal([]byte(msg.json), &snapshot); err == nil && snapshot.Type == "portfolio.snapshot" {
 			state.portfolio = snapshot
 			state.hasPortfolio = true
+			state.rules = snapshot.Rules
 			state.status = fmt.Sprintf("portfolio refreshed: cash %.2f", moneyValue(snapshot.AvailableCash))
 			return
 		}
@@ -885,6 +908,7 @@ func applyActionResponse(state *uiState, msg actionResponseMsg) {
 			if result.Portfolio.Type == "portfolio.snapshot" {
 				state.portfolio = result.Portfolio
 				state.hasPortfolio = true
+				state.rules = result.Portfolio.Rules
 			}
 			state.status = "order accepted"
 			return
@@ -905,6 +929,7 @@ func applyActionResponse(state *uiState, msg actionResponseMsg) {
 			if result.Portfolio.Type == "portfolio.snapshot" {
 				state.portfolio = result.Portfolio
 				state.hasPortfolio = true
+				state.rules = result.Portfolio.Rules
 			}
 			switch result.Payload.Type {
 			case "intel.purchase.armed":
@@ -923,7 +948,6 @@ func applyActionResponse(state *uiState, msg actionResponseMsg) {
 	}
 	state.status = "action completed"
 }
-
 func parseWholeUnits(raw string) (int64, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -967,25 +991,39 @@ func moveSelection(state *uiState, delta int, prefix string) {
 }
 
 func zoomChart(state *uiState, delta int) {
-	state.chartZoom += delta
-	if state.chartZoom < 0 {
+	base := timeframeHistory(state.ticks[currentSymbol(state.cfg.Symbols, state.selected)].History, timeframePresets[state.timeframe].Duration)
+	if len(base) == 0 {
 		state.chartZoom = 0
+		state.chartOffset = 0
+		return
+	}
+	plotWidth := effectiveChartPlotWidth(state)
+	oldVisible := computeVisiblePoints(len(base), plotWidth, state.chartZoom)
+	oldOffset := clampInt(state.chartOffset, 0, max(0, len(base)-oldVisible))
+	oldEnd := len(base) - oldOffset
+	oldStart := max(0, oldEnd-oldVisible)
+	oldCenter := oldStart + oldVisible/2
+
+	state.chartZoom += delta
+	if state.chartZoom < -6 {
+		state.chartZoom = -6
 	}
 	if state.chartZoom > 12 {
 		state.chartZoom = 12
 	}
+
+	newVisible := computeVisiblePoints(len(base), plotWidth, state.chartZoom)
+	newStart := clampInt(oldCenter-newVisible/2, 0, max(0, len(base)-newVisible))
+	state.chartOffset = len(base) - (newStart + newVisible)
 	clampViewport(state)
-	state.status = fmt.Sprintf("chart zoom x%.2f", chartZoomFactor(state.chartZoom))
 }
 
 func panChart(state *uiState, delta int) {
-	state.chartOffset += delta
-	clampViewport(state)
-	if state.chartOffset == 0 {
-		state.status = "chart focus moved to latest candles"
+	if delta == 0 {
 		return
 	}
-	state.status = fmt.Sprintf("chart moved %d points from latest", state.chartOffset)
+	state.chartOffset += delta
+	clampViewport(state)
 }
 
 func shiftTimeframe(state *uiState, delta int) {
@@ -1009,7 +1047,7 @@ func clampViewport(state *uiState) {
 		return
 	}
 	base := timeframeHistory(tick.History, timeframePresets[state.timeframe].Duration)
-	visible := computeVisiblePoints(len(base), state.chartZoom, 8)
+	visible := computeVisiblePoints(len(base), effectiveChartPlotWidth(state), state.chartZoom)
 	maxOffset := max(0, len(base)-visible)
 	if state.chartOffset < 0 {
 		state.chartOffset = 0
@@ -1022,8 +1060,8 @@ func clampViewport(state *uiState) {
 func panStep(state *uiState) int {
 	tick := state.ticks[currentSymbol(state.cfg.Symbols, state.selected)]
 	base := timeframeHistory(tick.History, timeframePresets[state.timeframe].Duration)
-	visible := computeVisiblePoints(len(base), state.chartZoom, 8)
-	return max(4, visible/6)
+	visible := computeVisiblePoints(len(base), effectiveChartPlotWidth(state), state.chartZoom)
+	return max(1, visible/8)
 }
 
 func handleMouseEvent(ev *tcell.EventMouse, state *uiState, cfg config, events chan<- any) {
@@ -1206,6 +1244,7 @@ func renderChartPanel(screen tcell.Screen, colors palette, rect tickerRect, symb
 	if plotY2-plotY1 < 6 {
 		plotY1 = innerY1 + 1
 	}
+	state.chartPlotWidth = max(1, plotX2-plotX1+1)
 	visible, start, end := chartViewport(tick.History, plotX2-plotX1, state.chartZoom, state.chartOffset, timeframePresets[state.timeframe].Duration)
 	viewportLabel := fmt.Sprintf("tf %s  view %d:%d  zoom x%.2f", timeframePresets[state.timeframe].Label, start+1, end, chartZoomFactor(state.chartZoom))
 	drawText(screen, max(plotX1, plotX2-runeLen(viewportLabel)), innerY1, colors.mutedOn(colors.panelBG), viewportLabel)
@@ -1233,6 +1272,8 @@ func renderSidebar(screen tcell.Screen, colors palette, rect tickerRect, symbol 
 		{"15m", fmt.Sprintf("%+.2f%%", tick.Change15mPct), styleForChange(colors, tick.Change15mPct, colors.panelAltBG)},
 		{"timeframe", timeframePresets[state.timeframe].Label, colors.neutral},
 		{"zoom", fmt.Sprintf("x%.2f", chartZoomFactor(state.chartZoom)), colors.neutral},
+		{"fee", fmt.Sprintf("%.2fbp", float64(state.rules.ExchangeFeeBps)/100.0), colors.neutral},
+		{"mkt+", fmt.Sprintf("%.2fbp", float64(state.rules.MarketOrderSurchargeBps)/100.0), colors.neutral},
 	}
 	for _, line := range lines {
 		if y >= rect.Y2-2 {
@@ -1290,6 +1331,23 @@ func renderSidebar(screen tcell.Screen, colors palette, rect tickerRect, symbol 
 		}
 		drawTicketField(screen, rect.X1+2, y, colors, colors.panelAltBG, "qty", state.ticket.Quantity, state.ticket.Field == 2)
 		y++
+		est := estimateTicketCost(state, symbol, tick)
+		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), fmt.Sprintf("fee %.2f", moneyValue(est.ExchangeFee)))
+		y++
+		if est.MarketOrderSurcharge > 0 {
+			drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), fmt.Sprintf("impact %.2f", moneyValue(est.MarketOrderSurcharge)))
+			y++
+		}
+		if est.RapidFlipTax > 0 {
+			drawText(screen, rect.X1+2, y, colors.negativeOn(colors.panelAltBG), fmt.Sprintf("flip tax %.2f", moneyValue(est.RapidFlipTax)))
+			y++
+		}
+		label := "total debit"
+		if state.ticket.Side == "sell" {
+			label = "net credit"
+		}
+		drawText(screen, rect.X1+2, y, colors.headerOn(colors.panelAltBG), fmt.Sprintf("%s %.2f", label, moneyValue(est.Total)))
+		y++
 		drawText(screen, rect.X1+2, y, colors.mutedOn(colors.panelAltBG), "Tab switch | Enter send | Esc close | click book level")
 		y++
 	} else {
@@ -1342,6 +1400,63 @@ func drawTicketField(screen tcell.Screen, x int, y int, colors palette, bg tcell
 	drawText(screen, x+10, y, valueStyle, value)
 }
 
+type ticketCostEstimate struct {
+	Notional             int64
+	ExchangeFee          int64
+	MarketOrderSurcharge int64
+	RapidFlipTax         int64
+	Total                int64
+}
+
+func estimateTicketCost(state *uiState, symbol string, tick charting.PriceChartTick) ticketCostEstimate {
+	qty, err := parseWholeUnits(state.ticket.Quantity)
+	if err != nil || qty <= 0 {
+		return ticketCostEstimate{}
+	}
+	price := int64(math.Round(tick.CurrentPrice * 100))
+	if state.ticket.OrderType == "limit" {
+		if parsed, parseErr := parseMoneyToCents(state.ticket.Price); parseErr == nil && parsed > 0 {
+			price = parsed
+		}
+	}
+	if price <= 0 {
+		return ticketCostEstimate{}
+	}
+	notional := price * qty
+	est := ticketCostEstimate{
+		Notional:    notional,
+		ExchangeFee: chargeBps(notional, state.rules.ExchangeFeeBps),
+	}
+	if state.ticket.OrderType == "market" {
+		est.MarketOrderSurcharge = chargeBps(notional, state.rules.MarketOrderSurchargeBps)
+	}
+	if state.ticket.Side == "sell" {
+		fresh := int64(0)
+		if state.portfolio.FreshStock != nil {
+			fresh = state.portfolio.FreshStock[symbol]
+		}
+		taxableQty := min64(qty, fresh)
+		est.RapidFlipTax = chargeBps(price*taxableQty, state.rules.RapidFlipTaxBps)
+		est.Total = notional - est.ExchangeFee - est.MarketOrderSurcharge - est.RapidFlipTax
+		return est
+	}
+	est.Total = notional + est.ExchangeFee + est.MarketOrderSurcharge
+	return est
+}
+
+func chargeBps(amount int64, bps int64) int64 {
+	if amount <= 0 || bps <= 0 {
+		return 0
+	}
+	return (amount*bps + 9999) / 10000
+}
+
+func min64(a int64, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
 func moneyValue(raw int64) float64 {
 	return math.Round((float64(raw)/100.0)*100) / 100
 }
@@ -1349,7 +1464,6 @@ func renderChartPlot(screen tcell.Screen, colors palette, x1 int, y1 int, x2 int
 	if x2 <= x1 || y2 <= y1 || len(history) == 0 {
 		return
 	}
-	width := x2 - x1 + 1
 	height := y2 - y1 + 1
 	minPrice := history[0].Price
 	maxPrice := history[0].Price
@@ -1374,24 +1488,27 @@ func renderChartPlot(screen tcell.Screen, colors palette, x1 int, y1 int, x2 int
 		drawText(screen, x1+1, y, colors.mutedOn(colors.panelBG), fmt.Sprintf("%.2f", labelValue))
 	}
 
-	sampled := sampleHistory(history, max(2, width-2))
-	points := make([]plotPoint, 0, len(sampled))
-	for idx, point := range sampled {
-		x := x1 + 1 + idx
+	points := make([]plotPoint, 0, len(history))
+	drawWidth := max(1, x2-(x1+1))
+	for idx, point := range history {
+		x := x1 + 1
+		if len(history) > 1 {
+			x += int(math.Round(float64(idx) * float64(drawWidth) / float64(len(history)-1)))
+		}
 		if x > x2 {
-			break
+			x = x2
 		}
 		y := mapValueToRow(point.Price, minPrice, maxPrice, y1, y2)
 		points = append(points, plotPoint{X: x, Y: y})
 	}
 	for idx := 1; idx < len(points); idx++ {
-		style := segmentStyle(colors, sampled[idx-1].Price, sampled[idx].Price, colors.panelBG)
+		style := segmentStyle(colors, history[idx-1].Price, history[idx].Price, colors.panelBG)
 		drawSegment(screen, points[idx-1], points[idx], style)
 	}
 	for idx, point := range points {
 		style := colors.chartOn(colors.panelBG)
 		if idx > 0 {
-			style = segmentStyle(colors, sampled[idx-1].Price, sampled[idx].Price, colors.panelBG)
+			style = segmentStyle(colors, history[idx-1].Price, history[idx].Price, colors.panelBG)
 		}
 		screen.SetContent(point.X, point.Y, '\u2022', nil, style)
 	}
@@ -1442,8 +1559,7 @@ func chartViewport(history []charting.HistoryPoint, plotWidth int, zoom int, off
 	if len(base) == 0 {
 		return history, 0, len(history)
 	}
-	minVisible := max(8, min(40, max(2, plotWidth/5)))
-	visible := computeVisiblePoints(len(base), zoom, minVisible)
+	visible := computeVisiblePoints(len(base), plotWidth+1, zoom)
 	maxOffset := max(0, len(base)-visible)
 	if offset < 0 {
 		offset = 0
@@ -1477,17 +1593,21 @@ func timeframeHistoryWithStart(history []charting.HistoryPoint, duration time.Du
 	return history[start:], start
 }
 
-func computeVisiblePoints(total int, zoom int, minVisible int) int {
+func computeVisiblePoints(total int, plotWidth int, zoom int) int {
 	if total <= 0 {
 		return 0
 	}
-	visible := float64(total)
-	for i := 0; i < zoom; i++ {
-		visible = visible / 2.0
+	baseVisible := clampInt(max(12, plotWidth-2), 8, total)
+	scale := math.Pow(1.6, float64(zoom))
+	if scale <= 0 {
+		scale = 1
 	}
-	count := int(math.Round(visible))
-	if count < minVisible {
-		count = minVisible
+	count := int(math.Round(float64(baseVisible) / scale))
+	if count < 8 {
+		count = 8
+	}
+	if count < 2 {
+		count = 2
 	}
 	if count > total {
 		count = total
@@ -1495,12 +1615,25 @@ func computeVisiblePoints(total int, zoom int, minVisible int) int {
 	return count
 }
 
-func chartZoomFactor(zoom int) float64 {
-	factor := 1.0
-	for i := 0; i < zoom; i++ {
-		factor *= 2.0
+func effectiveChartPlotWidth(state *uiState) int {
+	if state.chartPlotWidth > 0 {
+		return state.chartPlotWidth
 	}
-	return factor
+	return 96
+}
+
+func clampInt(value int, low int, high int) int {
+	if value < low {
+		return low
+	}
+	if value > high {
+		return high
+	}
+	return value
+}
+
+func chartZoomFactor(zoom int) float64 {
+	return math.Pow(1.6, float64(zoom))
 }
 
 func mapValueToRow(value float64, minValue float64, maxValue float64, top int, bottom int) int {
@@ -1763,3 +1896,7 @@ func sampleHistory(history []charting.HistoryPoint, target int) []charting.Histo
 	}
 	return out
 }
+
+
+
+

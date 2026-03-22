@@ -13,16 +13,23 @@ import (
 	"github.com/aeza/ssh-arena/internal/roles"
 )
 
+type PositionLot struct {
+	Quantity   int64     `json:"quantity"`
+	Price      int64     `json:"price"`
+	AcquiredAt time.Time `json:"acquired_at"`
+}
+
 type Player struct {
-	PlayerID       string           `json:"player_id"`
-	Username       string           `json:"username"`
-	Role           string           `json:"role"`
-	Cash           int64            `json:"cash"`
-	ReservedCash   int64            `json:"reserved_cash,omitempty"`
-	Portfolio      map[string]int64 `json:"portfolio"`
-	ReservedStocks map[string]int64 `json:"reserved_stocks,omitempty"`
-	CreatedAt      time.Time        `json:"created_at"`
-	LastLoginAt    time.Time        `json:"last_login_at"`
+	PlayerID       string                   `json:"player_id"`
+	Username       string                   `json:"username"`
+	Role           string                   `json:"role"`
+	Cash           int64                    `json:"cash"`
+	ReservedCash   int64                    `json:"reserved_cash,omitempty"`
+	Portfolio      map[string]int64         `json:"portfolio"`
+	ReservedStocks map[string]int64         `json:"reserved_stocks,omitempty"`
+	Lots           map[string][]PositionLot `json:"lots,omitempty"`
+	CreatedAt      time.Time                `json:"created_at"`
+	LastLoginAt    time.Time                `json:"last_login_at"`
 }
 
 type snapshot struct {
@@ -74,6 +81,9 @@ func (s *PlayerStore) load() error {
 			if player.ReservedStocks == nil {
 				player.ReservedStocks = make(map[string]int64)
 			}
+			if player.Lots == nil {
+				player.Lots = make(map[string][]PositionLot)
+			}
 			s.players[username] = player
 		}
 	}
@@ -107,6 +117,9 @@ func (s *PlayerStore) Upsert(player Player) error {
 	if player.ReservedStocks == nil {
 		player.ReservedStocks = make(map[string]int64)
 	}
+	if player.Lots == nil {
+		player.Lots = make(map[string][]PositionLot)
+	}
 	s.players[player.Username] = clonePlayer(player)
 	if err := s.persistLocked(); err != nil {
 		return err
@@ -127,6 +140,9 @@ func (s *PlayerStore) UpdateByPlayerID(playerID string, update func(*Player) err
 		}
 		if player.ReservedStocks == nil {
 			player.ReservedStocks = make(map[string]int64)
+		}
+		if player.Lots == nil {
+			player.Lots = make(map[string][]PositionLot)
 		}
 		if err := update(&player); err != nil {
 			return Player{}, err
@@ -180,6 +196,7 @@ func clonePlayer(player Player) Player {
 	copyPlayer := player
 	copyPlayer.Portfolio = cloneMap(player.Portfolio)
 	copyPlayer.ReservedStocks = cloneMap(player.ReservedStocks)
+	copyPlayer.Lots = cloneLotsMap(player.Lots)
 	return copyPlayer
 }
 
@@ -190,6 +207,19 @@ func cloneMap(source map[string]int64) map[string]int64 {
 	result := make(map[string]int64, len(source))
 	for key, value := range source {
 		result[key] = value
+	}
+	return result
+}
+
+func cloneLotsMap(source map[string][]PositionLot) map[string][]PositionLot {
+	if source == nil {
+		return make(map[string][]PositionLot)
+	}
+	result := make(map[string][]PositionLot, len(source))
+	for symbol, lots := range source {
+		copied := make([]PositionLot, len(lots))
+		copy(copied, lots)
+		result[symbol] = copied
 	}
 	return result
 }

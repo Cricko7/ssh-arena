@@ -42,10 +42,33 @@ type Engine struct {
 	logger              *slog.Logger
 }
 
+const (
+	exchangeFeeBps          int64 = 10
+	marketOrderSurchargeBps int64 = 15
+	rapidFlipTaxBps         int64 = 35
+)
+
+const rapidFlipWindow = 5 * time.Minute
+
 type openOrder struct {
 	Order            orderbook.Order
 	ReservedCash     int64
 	ReservedQuantity int64
+}
+
+type TradeRulesSnapshot struct {
+	ExchangeFeeBps          int64 `json:"exchange_fee_bps"`
+	MarketOrderSurchargeBps int64 `json:"market_order_surcharge_bps"`
+	RapidFlipTaxBps         int64 `json:"rapid_flip_tax_bps"`
+	RapidFlipWindowSeconds  int64 `json:"rapid_flip_window_seconds"`
+}
+
+type TradeCostBreakdown struct {
+	Notional             int64 `json:"notional"`
+	ExchangeFee          int64 `json:"exchange_fee"`
+	MarketOrderSurcharge int64 `json:"market_order_surcharge"`
+	RapidFlipTax         int64 `json:"rapid_flip_tax"`
+	Total                int64 `json:"total"`
 }
 
 type EnsurePlayerRequest struct {
@@ -69,17 +92,19 @@ type ExecuteActionRequest struct {
 }
 
 type PortfolioSnapshot struct {
-	Type           string           `json:"type"`
-	PlayerID       string           `json:"player_id"`
-	Username       string           `json:"username"`
-	Role           string           `json:"role"`
-	Cash           int64            `json:"cash"`
-	ReservedCash   int64            `json:"reserved_cash"`
-	AvailableCash  int64            `json:"available_cash"`
-	Portfolio      map[string]int64 `json:"portfolio"`
-	ReservedStocks map[string]int64 `json:"reserved_stocks"`
-	AvailableStock map[string]int64 `json:"available_stock"`
-	UpdatedAt      time.Time        `json:"updated_at"`
+	Type           string             `json:"type"`
+	PlayerID       string             `json:"player_id"`
+	Username       string             `json:"username"`
+	Role           string             `json:"role"`
+	Cash           int64              `json:"cash"`
+	ReservedCash   int64              `json:"reserved_cash"`
+	AvailableCash  int64              `json:"available_cash"`
+	Portfolio      map[string]int64   `json:"portfolio"`
+	ReservedStocks map[string]int64   `json:"reserved_stocks"`
+	AvailableStock map[string]int64   `json:"available_stock"`
+	FreshStock     map[string]int64   `json:"fresh_stock"`
+	Rules          TradeRulesSnapshot `json:"rules"`
+	UpdatedAt      time.Time          `json:"updated_at"`
 }
 
 type placeOrderPayload struct {
@@ -462,6 +487,14 @@ func (e *Engine) handleMarketCatalog() string {
 		"type":    "market.catalog",
 		"count":   len(e.symbols),
 		"symbols": append([]string(nil), e.symbols...),
+		"rules":   tradingRulesSnapshot(),
+	})
+}
+
+func (e *Engine) handleMarketRules() string {
+	return marshalJSON(map[string]any{
+		"type":  "market.rules",
+		"rules": tradingRulesSnapshot(),
 	})
 }
 
@@ -482,7 +515,11 @@ func (e *Engine) reserveForIncoming(player *state.Player, symbol string, side or
 		if kind == orderbook.OrderTypeMarket {
 			reservePrice = int64(float64(reservePrice) * 1.25)
 		}
-		reserveCash := reservePrice * qty
+		notional := reservePrice * qty
+		reserveCash := notional + estimateExchangeFee(notional)
+		if kind == orderbook.OrderTypeMarket {
+			reserveCash += estimateMarketSurcharge(notional)
+		}
 		availableCash := player.Cash - player.ReservedCash
 		if availableCash < reserveCash {
 			return 0, 0, fmt.Errorf("insufficient cash: need %d, available %d", reserveCash, availableCash)
@@ -527,31 +564,45 @@ func (e *Engine) applyTrade(trade orderbook.Trade, incomingOrderID string, incom
 		return err
 	}
 
-	buyer.Cash -= cost
+	buyerFee := estimateExchangeFee(cost)
+	sellerFee := estimateExchangeFee(cost)
+	buyerSurcharge := int64(0)
+	sellerSurcharge := int64(0)
+	if trade.BuyOrderID == incomingOrderID && incoming.Order.Type == orderbook.OrderTypeMarket {
+		buyerSurcharge = estimateMarketSurcharge(cost)
+	}
+	if trade.SellOrderID == incomingOrderID && incoming.Order.Type == orderbook.OrderTypeMarket {
+		sellerSurcharge = estimateMarketSurcharge(cost)
+	}
+	rapidFlipQty := consumeLotsForSale(seller, trade.Symbol, trade.Quantity, trade.ExecutedAt)
+	sellerFlipTax := estimateRapidFlipTax(trade.Price * rapidFlipQty)
+
+	buyer.Cash -= cost + buyerFee + buyerSurcharge
 	buyer.Portfolio[trade.Symbol] += trade.Quantity
+	addAcquiredLot(buyer, trade.Symbol, trade.Quantity, trade.Price, trade.ExecutedAt)
 	if trade.BuyOrderID == incomingOrderID {
-		buyer.ReservedCash -= cost
+		buyer.ReservedCash -= cost + buyerFee + buyerSurcharge
 		if buyer.ReservedCash < 0 {
 			buyer.ReservedCash = 0
 		}
-		incoming.ReservedCash -= cost
+		incoming.ReservedCash -= cost + buyerFee + buyerSurcharge
 		if incoming.ReservedCash < 0 {
 			incoming.ReservedCash = 0
 		}
 	} else if open := e.openOrders[trade.BuyOrderID]; open != nil {
 		open.Order.RemainingQuantity -= trade.Quantity
-		open.ReservedCash -= cost
+		open.ReservedCash -= cost + buyerFee + buyerSurcharge
 		if open.ReservedCash < 0 {
 			open.ReservedCash = 0
 		}
-		buyer.ReservedCash -= cost
+		buyer.ReservedCash -= cost + buyerFee + buyerSurcharge
 		if buyer.ReservedCash < 0 {
 			buyer.ReservedCash = 0
 		}
 		touchedOrders[trade.BuyOrderID] = struct{}{}
 	}
 
-	seller.Cash += cost
+	seller.Cash += cost - sellerFee - sellerSurcharge - sellerFlipTax
 	seller.Portfolio[trade.Symbol] -= trade.Quantity
 	if seller.Portfolio[trade.Symbol] < 0 {
 		seller.Portfolio[trade.Symbol] = 0
@@ -699,8 +750,10 @@ func (e *Engine) getTouchedPlayer(playerID string, touched map[string]*state.Pla
 
 func (e *Engine) snapshotPlayer(player state.Player) PortfolioSnapshot {
 	availableStocks := make(map[string]int64, len(player.Portfolio))
+	freshStocks := make(map[string]int64, len(player.Portfolio))
 	for _, symbol := range e.symbols {
 		availableStocks[symbol] = player.Portfolio[symbol] - player.ReservedStocks[symbol]
+		freshStocks[symbol] = max64(0, rapidFlipExposure(player, symbol, time.Now().UTC())-player.ReservedStocks[symbol])
 	}
 	return PortfolioSnapshot{
 		Type:           "portfolio.snapshot",
@@ -713,6 +766,8 @@ func (e *Engine) snapshotPlayer(player state.Player) PortfolioSnapshot {
 		Portfolio:      cloneMap(player.Portfolio),
 		ReservedStocks: cloneMap(player.ReservedStocks),
 		AvailableStock: availableStocks,
+		FreshStock:     freshStocks,
+		Rules:          tradingRulesSnapshot(),
 		UpdatedAt:      time.Now().UTC(),
 	}
 }
@@ -735,6 +790,113 @@ func (e *Engine) bootstrapJSON(player state.Player) (string, error) {
 	return string(raw), nil
 }
 
+func tradingRulesSnapshot() TradeRulesSnapshot {
+	return TradeRulesSnapshot{
+		ExchangeFeeBps:          exchangeFeeBps,
+		MarketOrderSurchargeBps: marketOrderSurchargeBps,
+		RapidFlipTaxBps:         rapidFlipTaxBps,
+		RapidFlipWindowSeconds:  int64(rapidFlipWindow / time.Second),
+	}
+}
+
+func buyReservationTarget(price int64, qty int64, kind orderbook.OrderType) int64 {
+	if price <= 0 || qty <= 0 {
+		return 0
+	}
+	notional := price * qty
+	total := notional + estimateExchangeFee(notional)
+	if kind == orderbook.OrderTypeMarket {
+		total += estimateMarketSurcharge(notional)
+	}
+	return total
+}
+
+func estimateExchangeFee(notional int64) int64 {
+	return bpsCharge(notional, exchangeFeeBps)
+}
+
+func estimateMarketSurcharge(notional int64) int64 {
+	return bpsCharge(notional, marketOrderSurchargeBps)
+}
+
+func estimateRapidFlipTax(notional int64) int64 {
+	return bpsCharge(notional, rapidFlipTaxBps)
+}
+
+func bpsCharge(amount int64, bps int64) int64 {
+	if amount <= 0 || bps <= 0 {
+		return 0
+	}
+	return (amount*bps + 9999) / 10000
+}
+
+func addAcquiredLot(player *state.Player, symbol string, qty int64, price int64, acquiredAt time.Time) {
+	if qty <= 0 {
+		return
+	}
+	if player.Lots == nil {
+		player.Lots = make(map[string][]state.PositionLot)
+	}
+	player.Lots[symbol] = append(player.Lots[symbol], state.PositionLot{Quantity: qty, Price: price, AcquiredAt: acquiredAt})
+}
+
+func consumeLotsForSale(player *state.Player, symbol string, qty int64, now time.Time) int64 {
+	if qty <= 0 || len(player.Lots[symbol]) == 0 {
+		return 0
+	}
+	lots := player.Lots[symbol]
+	taxableQty := int64(0)
+	remaining := qty
+	writeIdx := 0
+	for _, lot := range lots {
+		if remaining <= 0 {
+			lots[writeIdx] = lot
+			writeIdx++
+			continue
+		}
+		consume := min64(remaining, lot.Quantity)
+		if now.Sub(lot.AcquiredAt) <= rapidFlipWindow {
+			taxableQty += consume
+		}
+		lot.Quantity -= consume
+		remaining -= consume
+		if lot.Quantity > 0 {
+			lots[writeIdx] = lot
+			writeIdx++
+		}
+	}
+	lots = lots[:writeIdx]
+	if len(lots) == 0 {
+		delete(player.Lots, symbol)
+	} else {
+		player.Lots[symbol] = lots
+	}
+	return taxableQty
+}
+
+func rapidFlipExposure(player state.Player, symbol string, now time.Time) int64 {
+	var qty int64
+	for _, lot := range player.Lots[symbol] {
+		if now.Sub(lot.AcquiredAt) <= rapidFlipWindow {
+			qty += lot.Quantity
+		}
+	}
+	return qty
+}
+
+func min64(a int64, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max64(a int64, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 func decodeJSON(raw string) any {
 	var out any
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
