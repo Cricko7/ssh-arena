@@ -7,7 +7,11 @@ import (
 	"path/filepath"
 	"slices"
 	"time"
+
+	"github.com/aeza/ssh-arena/internal/clientlog"
 )
+
+var profileLogger = clientlog.L("client.profile")
 
 type Profile struct {
 	Version    int       `json:"version"`
@@ -22,13 +26,16 @@ type Profile struct {
 
 func ResolveProfilePath(path string) (string, error) {
 	if path != "" {
+		profileLogger.Debug("using explicit client profile path", "path", path)
 		return path, nil
 	}
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user config dir: %w", err)
 	}
-	return filepath.Join(configDir, "ssh-arena", "client.json"), nil
+	resolved := filepath.Join(configDir, "ssh-arena", "client.json")
+	profileLogger.Debug("resolved client profile path", "path", resolved)
+	return resolved, nil
 }
 
 func LoadProfile(path string) (Profile, error) {
@@ -41,6 +48,13 @@ func LoadProfile(path string) (Profile, error) {
 		return Profile{}, fmt.Errorf("decode client profile: %w", err)
 	}
 	profile.Symbols = normalizeProfileSymbols(profile.Symbols)
+	profileLogger.Info("client profile loaded",
+		"path", path,
+		"player_id", profile.PlayerID,
+		"username", profile.Username,
+		"symbols", len(profile.Symbols),
+		"last_ticker", profile.LastTicker,
+	)
 	return profile, nil
 }
 
@@ -62,6 +76,13 @@ func SaveProfile(path string, profile Profile) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace client profile: %w", err)
 	}
+	profileLogger.Info("client profile saved",
+		"path", path,
+		"player_id", profile.PlayerID,
+		"username", profile.Username,
+		"symbols", len(profile.Symbols),
+		"last_ticker", profile.LastTicker,
+	)
 	return nil
 }
 

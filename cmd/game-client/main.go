@@ -24,6 +24,7 @@ import (
 	gamev1 "github.com/aeza/ssh-arena/gen/game/v1"
 	"github.com/aeza/ssh-arena/internal/charting"
 	"github.com/aeza/ssh-arena/internal/client"
+	"github.com/aeza/ssh-arena/internal/clientlog"
 	"github.com/aeza/ssh-arena/internal/grpcjson"
 )
 
@@ -187,7 +188,13 @@ type actionClientCache struct {
 	api  gamev1.GameServiceClient
 }
 
-var sharedActionClient actionClientCache
+var (
+	sharedActionClient = actionClientCache{}
+	clientLogger       = clientlog.L("game-client")
+	actionLogger       = clientlog.L("game-client.action")
+	chartLogger        = clientlog.L("game-client.chart")
+	marketLogger       = clientlog.L("game-client.market")
+)
 
 func newPalette() palette {
 	p := palette{
@@ -259,8 +266,10 @@ func (p palette) gridOn(bg tcell.Color) tcell.Style {
 func main() {
 	cfg, playerLabel, err := resolveConfig()
 	if err != nil {
+		clientLogger.Error("resolve client config failed", "error", err)
 		log.Fatal(err)
 	}
+	clientLogger.Info("client starting", "player_id", cfg.PlayerID, "grpc_addr", cfg.GRPCAddr, "ssh_addr", cfg.SSHAddr, "symbols", len(cfg.Symbols), "history_limit", cfg.HistoryLimit, "depth", cfg.Depth, "log_path", clientlog.Path())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -271,9 +280,11 @@ func main() {
 
 	screen, err := tcell.NewScreen()
 	if err != nil {
+		clientLogger.Error("create screen failed", "error", err)
 		log.Fatal(err)
 	}
 	if err := screen.Init(); err != nil {
+		clientLogger.Error("init screen failed", "error", err)
 		log.Fatal(err)
 	}
 	defer screen.Fini()
@@ -377,15 +388,18 @@ func main() {
 
 	profilePath, err := client.ResolveProfilePath(cfg.ProfilePath)
 	if err == nil {
-		_ = client.SaveProfile(profilePath, client.Profile{
+		if saveErr := client.SaveProfile(profilePath, client.Profile{
 			SSHAddr:    cfg.SSHAddr,
 			GRPCAddr:   cfg.GRPCAddr,
 			Username:   cfg.Username,
 			PlayerID:   cfg.PlayerID,
 			Symbols:    cfg.Symbols,
 			LastTicker: currentSymbol(cfg.Symbols, state.selected),
-		})
+		}); saveErr != nil {
+			clientLogger.Warn("save profile on shutdown failed", "path", profilePath, "error", saveErr)
+		}
 	}
+	clientLogger.Info("client shutdown complete", "player_id", cfg.PlayerID)
 }
 
 func resolveConfig() (config, string, error) {
@@ -407,14 +421,23 @@ func resolveConfig() (config, string, error) {
 	if err != nil {
 		return config{}, "", err
 	}
+	clientLogger.Info("resolved client profile path", "path", profilePath)
 	if cfg.ResetProfile {
-		_ = os.Remove(profilePath)
+		if removeErr := os.Remove(profilePath); removeErr == nil {
+			clientLogger.Info("client profile removed", "path", profilePath)
+		} else if !errors.Is(removeErr, os.ErrNotExist) {
+			clientLogger.Warn("client profile removal failed", "path", profilePath, "error", removeErr)
+		}
 	}
 
 	profile, profileErr := client.LoadProfile(profilePath)
 	hasProfile := profileErr == nil
-	if profileErr != nil && !errors.Is(profileErr, os.ErrNotExist) {
-		return config{}, "", fmt.Errorf("load client profile: %w", profileErr)
+	if profileErr != nil {
+		if errors.Is(profileErr, os.ErrNotExist) {
+			clientLogger.Info("client profile not found", "path", profilePath)
+		} else {
+			return config{}, "", fmt.Errorf("load client profile: %w", profileErr)
+		}
 	}
 
 	if cfg.PlayerID == "" && hasProfile {
@@ -441,9 +464,11 @@ func resolveConfig() (config, string, error) {
 		if cfg.Username == "" || cfg.Password == "" {
 			return config{}, "", fmt.Errorf("no saved profile found; run once with --user and --password to bootstrap over SSH")
 		}
-		bootstrap, err := client.BootstrapViaSSH(ctx, cfg.SSHAddr, cfg.Username, cfg.Password)
-		if err != nil {
-			return config{}, "", err
+		clientLogger.Info("starting bootstrap flow", "ssh_addr", cfg.SSHAddr, "username", cfg.Username)
+		bootstrap, bootstrapErr := client.BootstrapViaSSH(ctx, cfg.SSHAddr, cfg.Username, cfg.Password)
+		if bootstrapErr != nil {
+			clientLogger.Error("bootstrap flow failed", "ssh_addr", cfg.SSHAddr, "username", cfg.Username, "error", bootstrapErr)
+			return config{}, "", bootstrapErr
 		}
 		cfg.PlayerID = bootstrap.PlayerID
 		if cfg.GRPCAddr == "" {
@@ -457,18 +482,22 @@ func resolveConfig() (config, string, error) {
 		for symbol := range bootstrap.Portfolio {
 			portfolioSymbols = append(portfolioSymbols, symbol)
 		}
-		serverSymbols, err := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
-		if err != nil {
-			log.Printf("warning: fetch market catalog: %v", err)
+		serverSymbols, fetchErr := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
+		if fetchErr != nil {
+			clientLogger.Warn("fetch market catalog after bootstrap failed", "error", fetchErr)
+		} else {
+			clientLogger.Info("market catalog fetched after bootstrap", "symbols", len(serverSymbols))
 		}
 		cfg.Symbols = normalizeSymbols(*symbolsFlag, mergeFallback(mergeFallback(profile.Symbols, portfolioSymbols), serverSymbols))
 	} else {
 		if cfg.GRPCAddr == "" {
 			cfg.GRPCAddr = "localhost:9090"
 		}
-		serverSymbols, err := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
-		if err != nil {
-			log.Printf("warning: fetch market catalog: %v", err)
+		serverSymbols, fetchErr := fetchMarketSymbols(config{GRPCAddr: cfg.GRPCAddr, PlayerID: cfg.PlayerID})
+		if fetchErr != nil {
+			clientLogger.Warn("fetch market catalog from saved profile failed", "error", fetchErr)
+		} else {
+			clientLogger.Info("market catalog fetched from saved profile", "symbols", len(serverSymbols))
 		}
 		cfg.Symbols = normalizeSymbols(*symbolsFlag, mergeFallback(profile.Symbols, serverSymbols))
 		if cfg.Username != "" {
@@ -488,20 +517,21 @@ func resolveConfig() (config, string, error) {
 		cfg.Initial = cfg.Symbols[0]
 	}
 
-	if err := client.SaveProfile(profilePath, client.Profile{
+	if saveErr := client.SaveProfile(profilePath, client.Profile{
 		SSHAddr:    cfg.SSHAddr,
 		GRPCAddr:   cfg.GRPCAddr,
 		Username:   cfg.Username,
 		PlayerID:   cfg.PlayerID,
 		Symbols:    cfg.Symbols,
 		LastTicker: cfg.Initial,
-	}); err != nil {
-		log.Printf("warning: save client profile: %v", err)
+	}); saveErr != nil {
+		clientLogger.Warn("save client profile failed", "path", profilePath, "error", saveErr)
+	} else {
+		clientLogger.Info("client config resolved", "player_id", cfg.PlayerID, "grpc_addr", cfg.GRPCAddr, "symbols", len(cfg.Symbols), "initial", cfg.Initial)
 	}
 
 	return cfg, playerLabel, nil
 }
-
 func handleKeyEvent(ev *tcell.EventKey, state *uiState, cfg config, events chan<- any) bool {
 	if state.ticket.Active {
 		return handleTicketKeyEvent(ev, state, cfg, events)
@@ -703,9 +733,11 @@ func buyInsiderAsync(cfg config, state *uiState, events chan<- any) {
 func executeActionAsync(cfg config, actionID string, payload any, events chan<- any) {
 	response, err := executeActionJSON(cfg, actionID, payload)
 	if err != nil {
+		actionLogger.Error("action failed", "action_id", actionID, "player_id", cfg.PlayerID, "error", err)
 		events <- errMsg{err: err}
 		return
 	}
+	actionLogger.Info("action completed", "action_id", actionID, "player_id", cfg.PlayerID, "response_bytes", len(response))
 	events <- actionResponseMsg{actionID: actionID, json: response}
 }
 
@@ -722,6 +754,8 @@ func executeActionJSON(cfg config, actionID string, payload any) (string, error)
 
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
+		started := time.Now()
+		actionLogger.Info("action request started", "action_id", actionID, "player_id", cfg.PlayerID, "attempt", attempt+1, "grpc_addr", cfg.GRPCAddr)
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		api, err := sharedActionClient.client(ctx, cfg.GRPCAddr, codec)
 		if err == nil {
@@ -734,8 +768,11 @@ func executeActionJSON(cfg config, actionID string, payload any) (string, error)
 			cancel()
 			if callErr == nil {
 				if resp.Status != "ok" {
-					return "", fmt.Errorf("%s", extractErrorMessage(resp.ResponseJSON))
+					err = fmt.Errorf("%s", extractErrorMessage(resp.ResponseJSON))
+					actionLogger.Warn("action returned application error", "action_id", actionID, "player_id", cfg.PlayerID, "attempt", attempt+1, "duration", time.Since(started), "error", err)
+					return "", err
 				}
+				actionLogger.Info("action request succeeded", "action_id", actionID, "player_id", cfg.PlayerID, "attempt", attempt+1, "duration", time.Since(started))
 				return resp.ResponseJSON, nil
 			}
 			lastErr = callErr
@@ -743,6 +780,7 @@ func executeActionJSON(cfg config, actionID string, payload any) (string, error)
 			cancel()
 			lastErr = err
 		}
+		actionLogger.Warn("action request failed", "action_id", actionID, "player_id", cfg.PlayerID, "attempt", attempt+1, "duration", time.Since(started), "error", lastErr)
 		sharedActionClient.reset(cfg.GRPCAddr)
 		if !shouldRetryAction(lastErr) {
 			break
@@ -768,25 +806,30 @@ func (c *actionClientCache) client(ctx context.Context, addr string, codec encod
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn != nil && c.addr == addr && c.api != nil {
+		actionLogger.Debug("reusing action grpc connection", "grpc_addr", addr)
 		return c.api, nil
 	}
 	if c.conn != nil {
+		actionLogger.Info("closing stale action grpc connection", "grpc_addr", c.addr)
 		_ = c.conn.Close()
 		c.conn = nil
 		c.api = nil
 		c.addr = ""
 	}
+	started := time.Now()
 	conn, err := grpc.DialContext(ctx, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(codec)),
 		grpc.WithBlock(),
 	)
 	if err != nil {
+		actionLogger.Error("grpc dial failed", "grpc_addr", addr, "duration", time.Since(started), "error", err)
 		return nil, fmt.Errorf("grpc dial: %w", err)
 	}
 	c.conn = conn
 	c.api = gamev1.NewGameServiceClient(conn)
 	c.addr = addr
+	actionLogger.Info("grpc connection established", "grpc_addr", addr, "duration", time.Since(started))
 	return c.api, nil
 }
 
@@ -797,13 +840,13 @@ func (c *actionClientCache) reset(addr string) {
 		return
 	}
 	if c.conn != nil {
+		actionLogger.Info("resetting action grpc connection", "grpc_addr", c.addr)
 		_ = c.conn.Close()
 	}
 	c.conn = nil
 	c.api = nil
 	c.addr = ""
 }
-
 func applyActionResponse(state *uiState, msg actionResponseMsg) {
 	if msg.actionID == "portfolio.get" {
 		var snapshot portfolioSnapshot
@@ -1585,6 +1628,7 @@ func mergeFallback(primary []string, secondary []string) []string {
 func fetchMarketSymbols(cfg config) ([]string, error) {
 	response, err := executeActionJSON(cfg, "market.catalog", map[string]any{})
 	if err != nil {
+		clientLogger.Warn("market catalog request failed", "player_id", cfg.PlayerID, "grpc_addr", cfg.GRPCAddr, "error", err)
 		return nil, err
 	}
 	var payload struct {
@@ -1597,6 +1641,7 @@ func fetchMarketSymbols(cfg config) ([]string, error) {
 	if payload.Type != "market.catalog" {
 		return nil, fmt.Errorf("unexpected market catalog payload %q", payload.Type)
 	}
+	clientLogger.Info("market catalog loaded", "player_id", cfg.PlayerID, "symbols", len(payload.Symbols))
 	return payload.Symbols, nil
 }
 
@@ -1607,20 +1652,25 @@ func startChartStream(ctx context.Context, cfg config, ch chan<- any) {
 		ch <- errMsg{err: fmt.Errorf("json gRPC codec is not registered")}
 		return
 	}
+	chartLogger.Info("chart stream dialing", "grpc_addr", cfg.GRPCAddr, "player_id", cfg.PlayerID, "symbols", len(cfg.Symbols))
+	started := time.Now()
 	conn, err := grpc.DialContext(ctx, cfg.GRPCAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(codec)),
 		grpc.WithBlock(),
 	)
 	if err != nil {
+		chartLogger.Error("chart stream dial failed", "grpc_addr", cfg.GRPCAddr, "player_id", cfg.PlayerID, "duration", time.Since(started), "error", err)
 		ch <- errMsg{err: fmt.Errorf("grpc dial: %w", err)}
 		return
 	}
 	defer conn.Close()
+	chartLogger.Info("chart stream connected", "grpc_addr", cfg.GRPCAddr, "player_id", cfg.PlayerID, "duration", time.Since(started))
 
 	api := gamev1.NewGameServiceClient(conn)
 	stream, err := api.SubscribeToChart(ctx)
 	if err != nil {
+		chartLogger.Error("chart stream subscribe failed", "grpc_addr", cfg.GRPCAddr, "player_id", cfg.PlayerID, "error", err)
 		ch <- errMsg{err: fmt.Errorf("subscribe chart: %w", err)}
 		return
 	}
@@ -1631,9 +1681,11 @@ func startChartStream(ctx context.Context, cfg config, ch chan<- any) {
 			HistoryLimit:   uint32(cfg.HistoryLimit),
 			OrderbookDepth: uint32(cfg.Depth),
 		}); err != nil {
+			chartLogger.Error("chart stream subscription send failed", "player_id", cfg.PlayerID, "ticker", symbol, "error", err)
 			ch <- errMsg{err: fmt.Errorf("subscribe %s: %w", symbol, err)}
 			return
 		}
+		chartLogger.Info("chart stream subscribed ticker", "player_id", cfg.PlayerID, "ticker", symbol, "history_limit", cfg.HistoryLimit, "depth", cfg.Depth)
 	}
 	ch <- statusMsg{text: fmt.Sprintf("subscribed to %d tickers", len(cfg.Symbols))}
 
@@ -1642,21 +1694,24 @@ func startChartStream(ctx context.Context, cfg config, ch chan<- any) {
 		if err != nil {
 			select {
 			case <-ctx.Done():
+				chartLogger.Info("chart stream closed", "player_id", cfg.PlayerID, "reason", ctx.Err())
 				return
 			default:
+				chartLogger.Error("chart stream receive failed", "player_id", cfg.PlayerID, "error", err)
 				ch <- errMsg{err: fmt.Errorf("chart recv: %w", err)}
 				return
 			}
 		}
 		var tick charting.PriceChartTick
 		if err := json.Unmarshal([]byte(msg.JSON), &tick); err != nil {
+			chartLogger.Warn("chart tick decode failed", "player_id", cfg.PlayerID, "error", err)
 			ch <- errMsg{err: fmt.Errorf("decode chart tick: %w", err)}
 			continue
 		}
+		chartLogger.Debug("chart tick received", "player_id", cfg.PlayerID, "ticker", tick.Ticker, "history_points", len(tick.History), "current_price", tick.CurrentPrice)
 		ch <- chartTickMsg{tick: tick}
 	}
 }
-
 func currentSymbol(symbols []string, selected int) string {
 	if len(symbols) == 0 {
 		return ""

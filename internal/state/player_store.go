@@ -3,11 +3,13 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/aeza/ssh-arena/internal/logx"
 	"github.com/aeza/ssh-arena/internal/roles"
 )
 
@@ -31,16 +33,19 @@ type PlayerStore struct {
 	mu      sync.Mutex
 	path    string
 	players map[string]Player
+	logger  *slog.Logger
 }
 
 func LoadPlayerStore(path string) (*PlayerStore, error) {
 	store := &PlayerStore{
 		path:    path,
 		players: make(map[string]Player),
+		logger:  logx.L("state.player"),
 	}
 	if err := store.load(); err != nil {
 		return nil, err
 	}
+	store.logger.Info("player store ready", "path", path, "players", len(store.players))
 	return store, nil
 }
 
@@ -48,11 +53,13 @@ func (s *PlayerStore) load() error {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			s.logger.Info("player store file not found", "path", s.path)
 			return nil
 		}
 		return fmt.Errorf("read player store: %w", err)
 	}
 	if len(raw) == 0 {
+		s.logger.Info("player store file empty", "path", s.path)
 		return nil
 	}
 	var snap snapshot
@@ -101,7 +108,11 @@ func (s *PlayerStore) Upsert(player Player) error {
 		player.ReservedStocks = make(map[string]int64)
 	}
 	s.players[player.Username] = clonePlayer(player)
-	return s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
+	s.logger.Info("player persisted", "username", player.Username, "player_id", player.PlayerID, "role", player.Role)
+	return nil
 }
 
 func (s *PlayerStore) UpdateByPlayerID(playerID string, update func(*Player) error) (Player, error) {
@@ -124,6 +135,7 @@ func (s *PlayerStore) UpdateByPlayerID(playerID string, update func(*Player) err
 		if err := s.persistLocked(); err != nil {
 			return Player{}, err
 		}
+		s.logger.Info("player updated", "username", player.Username, "player_id", player.PlayerID, "role", player.Role)
 		return clonePlayer(player), nil
 	}
 	return Player{}, fmt.Errorf("player %q not found", playerID)

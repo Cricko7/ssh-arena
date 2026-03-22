@@ -11,7 +11,11 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/aeza/ssh-arena/internal/clientlog"
 )
+
+var bootstrapLogger = clientlog.L("client.bootstrap")
 
 type BootstrapInfo struct {
 	GRPCEndpoint string
@@ -33,6 +37,8 @@ func BootstrapViaSSH(ctx context.Context, addr string, username string, password
 		return BootstrapInfo{}, fmt.Errorf("ssh password is required")
 	}
 
+	bootstrapLogger.Info("starting ssh bootstrap", "addr", addr, "username", username)
+
 	cfg := &ssh.ClientConfig{
 		User:            username,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
@@ -40,16 +46,17 @@ func BootstrapViaSSH(ctx context.Context, addr string, username string, password
 		Timeout:         8 * time.Second,
 	}
 
-	dialer := &ssh.Client{}
-	_ = dialer
 	conn, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
+		bootstrapLogger.Error("ssh bootstrap dial failed", "addr", addr, "username", username, "error", err)
 		return BootstrapInfo{}, fmt.Errorf("ssh dial: %w", err)
 	}
 	defer conn.Close()
+	bootstrapLogger.Info("ssh bootstrap dialed", "addr", addr, "username", username)
 
 	session, err := conn.NewSession()
 	if err != nil {
+		bootstrapLogger.Error("ssh bootstrap session failed", "addr", addr, "username", username, "error", err)
 		return BootstrapInfo{}, fmt.Errorf("ssh session: %w", err)
 	}
 	defer session.Close()
@@ -95,6 +102,7 @@ func BootstrapViaSSH(ctx context.Context, addr string, username string, password
 
 	select {
 	case <-ctx.Done():
+		bootstrapLogger.Warn("ssh bootstrap cancelled", "addr", addr, "username", username, "error", ctx.Err())
 		return BootstrapInfo{}, ctx.Err()
 	case result := <-readDone:
 		_ = session.Close()
@@ -102,6 +110,17 @@ func BootstrapViaSSH(ctx context.Context, addr string, username string, password
 		case <-waitErr:
 		case <-time.After(500 * time.Millisecond):
 		}
+		if result.err != nil {
+			bootstrapLogger.Error("ssh bootstrap failed", "addr", addr, "username", username, "error", result.err)
+			return result.info, result.err
+		}
+		bootstrapLogger.Info("ssh bootstrap completed",
+			"addr", addr,
+			"username", username,
+			"player_id", result.info.PlayerID,
+			"grpc_endpoint", result.info.GRPCEndpoint,
+			"role", result.info.Role,
+		)
 		return result.info, result.err
 	}
 }

@@ -68,20 +68,25 @@ func startMarketStream(ctx context.Context, cfg config, ch chan<- any) {
 		ch <- errMsg{err: fmt.Errorf("json gRPC codec is not registered")}
 		return
 	}
+	marketLogger.Info("market stream dialing", "grpc_addr", cfg.GRPCAddr, "player_id", cfg.PlayerID, "symbols", len(cfg.Symbols))
+	started := time.Now()
 	conn, err := grpc.DialContext(ctx, cfg.GRPCAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(codec)),
 		grpc.WithBlock(),
 	)
 	if err != nil {
+		marketLogger.Error("market stream dial failed", "grpc_addr", cfg.GRPCAddr, "player_id", cfg.PlayerID, "duration", time.Since(started), "error", err)
 		ch <- errMsg{err: fmt.Errorf("grpc dial market stream: %w", err)}
 		return
 	}
 	defer conn.Close()
+	marketLogger.Info("market stream connected", "grpc_addr", cfg.GRPCAddr, "player_id", cfg.PlayerID, "duration", time.Since(started))
 
 	api := gamev1.NewGameServiceClient(conn)
 	stream, err := api.GetMarketStream(ctx)
 	if err != nil {
+		marketLogger.Error("market stream subscribe failed", "grpc_addr", cfg.GRPCAddr, "player_id", cfg.PlayerID, "error", err)
 		ch <- errMsg{err: fmt.Errorf("subscribe market stream: %w", err)}
 		return
 	}
@@ -93,16 +98,20 @@ func startMarketStream(ctx context.Context, cfg config, ch chan<- any) {
 		IncludeTrades:    true,
 		IncludeOrderbook: true,
 	}); err != nil {
+		marketLogger.Error("market stream subscription send failed", "player_id", cfg.PlayerID, "error", err)
 		ch <- errMsg{err: fmt.Errorf("send market stream subscription: %w", err)}
 		return
 	}
+	marketLogger.Info("market stream subscribed", "player_id", cfg.PlayerID, "symbols", len(cfg.Symbols))
 
 	for {
 		env, err := stream.Recv()
 		if err != nil {
 			if err == io.EOF || ctx.Err() != nil {
+				marketLogger.Info("market stream closed", "player_id", cfg.PlayerID, "reason", ctx.Err())
 				return
 			}
+			marketLogger.Error("market stream receive failed", "player_id", cfg.PlayerID, "error", err)
 			ch <- errMsg{err: fmt.Errorf("recv market stream: %w", err)}
 			return
 		}
@@ -110,21 +119,23 @@ func startMarketStream(ctx context.Context, cfg config, ch chan<- any) {
 		case "portfolio":
 			var snapshot portfolioSnapshot
 			if err := json.Unmarshal([]byte(env.JSON), &snapshot); err == nil && snapshot.Type == "portfolio.snapshot" {
+				marketLogger.Debug("portfolio stream update", "player_id", cfg.PlayerID, "cash", snapshot.AvailableCash)
 				ch <- streamPortfolioMsg{snapshot: snapshot}
 			}
 		case "market":
 			if event, ok := decodeMarketEvent(env.JSON); ok {
+				marketLogger.Debug("market event received", "player_id", cfg.PlayerID, "kind", event.Kind, "symbol", event.Symbol)
 				ch <- marketEventMsg{event: event}
 			}
 		case "chat", "private":
 			entry, ok := decodeChatEntry(env.JSON, env.Topic)
 			if ok {
+				marketLogger.Debug("chat entry received", "player_id", cfg.PlayerID, "topic", env.Topic, "type", entry.Type, "from", entry.PlayerID)
 				ch <- chatEntryMsg{entry: entry}
 			}
 		}
 	}
 }
-
 func decodeChatEntry(raw string, topic string) (chatEntry, bool) {
 	var entry chatEntry
 	if err := json.Unmarshal([]byte(raw), &entry); err == nil {
@@ -234,9 +245,12 @@ func scrollChat(state *uiState, delta int) {
 func submitChatAsync(cfg config, state *uiState, events chan<- any) {
 	payload, label, err := buildChatPayload(state.chatInput)
 	if err != nil {
+		marketLogger.Warn("build chat payload failed", "player_id", cfg.PlayerID, "error", err)
 		events <- errMsg{err: err}
 		return
 	}
+	_, direct := payload["to"]
+	marketLogger.Info("submitting chat message", "player_id", cfg.PlayerID, "direct", direct)
 	state.chatInput = ""
 	state.status = label
 	go executeActionAsync(cfg, "chat.send", payload, events)
@@ -350,6 +364,7 @@ func chatDisplayParts(entry chatEntry, selfID string, selfUsername string, color
 }
 
 func copyPlayerIDIntoChat(state *uiState, rect chatNameRect) {
+	marketLogger.Info("prepared dm target from chat", "player_id", rect.PlayerID, "username", rect.Username)
 	state.chatInput = "/dm " + rect.PlayerID + " "
 	state.chatFocus = true
 	if rect.PlayerID == "" {

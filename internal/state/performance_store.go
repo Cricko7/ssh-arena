@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aeza/ssh-arena/internal/jsonfile"
+	"github.com/aeza/ssh-arena/internal/logx"
 )
 
 type EquitySnapshot struct {
@@ -51,6 +53,7 @@ type PerformanceStore struct {
 	path         string
 	maxSnapshots int
 	snapshots    []EquitySnapshot
+	logger       *slog.Logger
 }
 
 func LoadPerformanceStore(path string, maxSnapshots int) (*PerformanceStore, error) {
@@ -61,10 +64,12 @@ func LoadPerformanceStore(path string, maxSnapshots int) (*PerformanceStore, err
 		path:         path,
 		maxSnapshots: maxSnapshots,
 		snapshots:    make([]EquitySnapshot, 0),
+		logger:       logx.L("state.performance"),
 	}
 	if err := store.load(); err != nil {
 		return nil, err
 	}
+	store.loggerOrDefault().Info("performance store ready", "path", path, "snapshots", len(store.snapshots), "max_snapshots", maxSnapshots)
 	return store, nil
 }
 
@@ -72,6 +77,7 @@ func (s *PerformanceStore) load() error {
 	var snap performanceSnapshot
 	if err := jsonfile.Read(s.path, &snap); err != nil {
 		if os.IsNotExist(err) {
+			s.loggerOrDefault().Info("performance store file not found", "path", s.path)
 			return nil
 		}
 		return fmt.Errorf("read performance store: %w", err)
@@ -91,7 +97,11 @@ func (s *PerformanceStore) Append(records []EquitySnapshot) error {
 	if len(s.snapshots) > s.maxSnapshots {
 		s.snapshots = slices.Clone(s.snapshots[len(s.snapshots)-s.maxSnapshots:])
 	}
-	return s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
+	s.loggerOrDefault().Info("performance snapshots persisted", "count", len(records), "snapshots", len(s.snapshots))
+	return nil
 }
 
 func (s *PerformanceStore) Leaderboard(window time.Duration, now time.Time, trades []TradeRecord, limit int) []LeaderboardEntry {
@@ -199,7 +209,15 @@ func (s *PerformanceStore) Leaderboard(window time.Duration, now time.Time, trad
 	for i := range entries {
 		entries[i].Rank = i + 1
 	}
+	s.loggerOrDefault().Info("leaderboard calculated", "window", window, "limit", limit, "entries", len(entries))
 	return entries
+}
+
+func (s *PerformanceStore) loggerOrDefault() *slog.Logger {
+	if s.logger == nil {
+		s.logger = logx.L("state.performance")
+	}
+	return s.logger
 }
 
 func (s *PerformanceStore) persistLocked() error {

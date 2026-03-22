@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/aeza/ssh-arena/internal/exchange"
 	"github.com/aeza/ssh-arena/internal/jsonfile"
+	"github.com/aeza/ssh-arena/internal/logx"
 	"github.com/aeza/ssh-arena/internal/marketevents"
 )
 
@@ -98,6 +100,7 @@ type Engine struct {
 	orderedDefs          []preparedDefinition
 	pendingInsiderBuyers map[string]struct{}
 	nextRandomEvent      *scheduledRandomEvent
+	logger               *slog.Logger
 }
 
 func LoadDefinitions(path string) ([]Definition, error) {
@@ -145,6 +148,7 @@ func NewEngine(cfg Config, defs []Definition, market Market, notifier Notifier) 
 		defs:                 preparedMap,
 		orderedDefs:          preparedList,
 		pendingInsiderBuyers: make(map[string]struct{}),
+		logger:               logx.L("intel"),
 	}, nil
 }
 
@@ -158,6 +162,7 @@ func (e *Engine) Catalog() []CatalogItem {
 		}
 		items = append(items, CatalogItem{ID: def.ID, Kind: def.Kind, Name: def.Name, Description: def.Description, Price: def.Price})
 	}
+	e.logger.Info("intel catalog built", "items", len(items))
 	return items
 }
 
@@ -181,6 +186,7 @@ func (e *Engine) Buy(ctx context.Context, playerID string, intelID string) (BuyR
 		e.mu.Unlock()
 		return BuyResult{}, fmt.Errorf("intel %q not found", intelID)
 	}
+	e.logger.Info("intel buy requested", "player_id", playerID, "intel_id", intelID, "kind", def.Kind)
 	if def.Kind == KindInsider {
 		result, err := e.buyInsiderLocked(playerID, def)
 		e.mu.Unlock()
@@ -190,6 +196,7 @@ func (e *Engine) Buy(ctx context.Context, playerID string, intelID string) (BuyR
 		if result.dispatchPayload != "" && e.notifier != nil {
 			e.notifier.NotifyPlayer(playerID, result.dispatchPayload)
 		}
+		e.logger.Info("insider intel purchased", "player_id", playerID, "intel_id", intelID, "cost", def.Price, "dispatch_immediate", result.dispatchPayload != "")
 		return BuyResult{Cost: def.Price, PayloadJSON: result.responsePayload}, nil
 	}
 	e.mu.Unlock()
@@ -201,6 +208,7 @@ func (e *Engine) Buy(ctx context.Context, playerID string, intelID string) (BuyR
 	if err != nil {
 		return BuyResult{}, err
 	}
+	e.logger.Info("paid analytics purchased", "player_id", playerID, "intel_id", intelID, "cost", def.Price)
 	return BuyResult{Cost: def.Price, PayloadJSON: payloadJSON}, nil
 }
 
@@ -219,6 +227,7 @@ func (e *Engine) buyInsiderLocked(playerID string, def preparedDefinition) (insi
 			return insiderBuyOutcome{}, fmt.Errorf("insider preview is already armed for your next market event")
 		}
 		e.pendingInsiderBuyers[playerID] = struct{}{}
+		e.logger.Info("insider armed for future random event", "player_id", playerID, "intel_id", def.ID)
 		payload := marshal(map[string]any{
 			"type":              "intel.purchase.armed",
 			"intel_id":          def.ID,
@@ -241,6 +250,7 @@ func (e *Engine) buyInsiderLocked(playerID string, def preparedDefinition) (insi
 	previewAt := current.Event.ScheduledAt.Add(-time.Duration(def.LeadTimeSeconds) * time.Second)
 	if previewAt.After(now) {
 		current.Buyers[playerID] = struct{}{}
+		e.logger.Info("insider armed for scheduled random event", "player_id", playerID, "intel_id", def.ID, "event_name", current.Event.EventName, "preview_at", previewAt)
 		payload := marshal(map[string]any{
 			"type":              "intel.purchase.armed",
 			"intel_id":          def.ID,
@@ -260,11 +270,13 @@ func (e *Engine) buyInsiderLocked(playerID string, def preparedDefinition) (insi
 	}
 
 	current.Buyers[playerID] = struct{}{}
+	e.logger.Info("insider preview dispatched immediately", "player_id", playerID, "intel_id", def.ID, "event_name", current.Event.EventName)
 	preview := e.buildInsiderPreview(def, current.Event, now)
 	return insiderBuyOutcome{responsePayload: preview, dispatchPayload: preview}, nil
 }
 
 func (e *Engine) Start(ctx context.Context) {
+	e.logger.Info("intel engine started", "definitions", len(e.orderedDefs), "interval", e.cfg.Interval)
 	go e.run(ctx)
 }
 
@@ -295,6 +307,7 @@ func (e *Engine) ScheduleNextRandomEvent(ctx context.Context, event marketevents
 		PreviewSent: false,
 	}
 	e.mu.Unlock()
+	e.logger.Info("next random event registered for insider flow", "event_id", event.ID, "name", event.EventName, "buyers", len(buyers), "scheduled_at", event.ScheduledAt)
 	e.maybeDispatchScheduledPreview(ctx, event.ID, now)
 }
 
@@ -363,6 +376,7 @@ func (e *Engine) prepareScheduledPreview(eventID string, now time.Time) (string,
 	}
 	payload := e.buildInsiderPreview(*def, e.nextRandomEvent.Event, now)
 	e.nextRandomEvent.PreviewSent = true
+	e.logger.Info("insider preview prepared", "event_id", eventID, "buyers", len(playerIDs))
 	return payload, playerIDs
 }
 
@@ -370,6 +384,7 @@ func (e *Engine) dispatchPreview(playerIDs []string, payload string) {
 	if e.notifier == nil || payload == "" {
 		return
 	}
+	e.logger.Info("dispatching insider preview", "recipients", len(playerIDs))
 	for _, playerID := range playerIDs {
 		e.notifier.NotifyPlayer(playerID, payload)
 	}
@@ -387,6 +402,7 @@ func (e *Engine) tick(ctx context.Context) {
 		if !trigger.ok {
 			continue
 		}
+		e.logger.Info("intel market event triggered", "kind", def.Kind, "name", trigger.name, "symbol", trigger.symbol, "multiplier", trigger.multiplier)
 		_, _ = e.market.TriggerMarketEvent(ctx, exchange.EventShockInput{
 			Kind:          string(def.Kind),
 			EventName:     trigger.name,

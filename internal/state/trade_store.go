@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aeza/ssh-arena/internal/jsonfile"
+	"github.com/aeza/ssh-arena/internal/logx"
 )
 
 type TradeRecord struct {
@@ -47,6 +49,7 @@ type TradeStore struct {
 	path       string
 	maxRecords int
 	trades     []TradeRecord
+	logger     *slog.Logger
 }
 
 func LoadTradeStore(path string, maxRecords int) (*TradeStore, error) {
@@ -57,10 +60,12 @@ func LoadTradeStore(path string, maxRecords int) (*TradeStore, error) {
 		path:       path,
 		maxRecords: maxRecords,
 		trades:     make([]TradeRecord, 0),
+		logger:     logx.L("state.trade"),
 	}
 	if err := store.load(); err != nil {
 		return nil, err
 	}
+	store.logger.Info("trade store ready", "path", path, "records", len(store.trades), "max_records", maxRecords)
 	return store, nil
 }
 
@@ -68,6 +73,7 @@ func (s *TradeStore) load() error {
 	var snap tradeSnapshot
 	if err := jsonfile.Read(s.path, &snap); err != nil {
 		if os.IsNotExist(err) {
+			s.logger.Info("trade store file not found", "path", s.path)
 			return nil
 		}
 		return fmt.Errorf("read trade store: %w", err)
@@ -87,7 +93,11 @@ func (s *TradeStore) Append(records []TradeRecord) error {
 	if len(s.trades) > s.maxRecords {
 		s.trades = slices.Clone(s.trades[len(s.trades)-s.maxRecords:])
 	}
-	return s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
+	s.logger.Info("trade batch persisted", "count", len(records), "records", len(s.trades))
+	return nil
 }
 
 func (s *TradeStore) Query(query TradeQuery) []TradeRecord {
@@ -119,6 +129,7 @@ func (s *TradeStore) Query(query TradeQuery) []TradeRecord {
 			break
 		}
 	}
+	s.logger.Info("trade history queried", "player_id", query.PlayerID, "symbol", query.Symbol, "limit", limit, "returned", len(out))
 	return out
 }
 

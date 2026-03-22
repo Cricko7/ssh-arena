@@ -42,6 +42,7 @@ func (e *Engine) handleTradeHistory(req ExecuteActionRequest) (string, error) {
 		query.Since = time.Now().UTC().Add(-time.Duration(payload.SinceSeconds) * time.Second)
 	}
 	trades := e.tradeHistory.Query(query)
+	e.logger.Info("trade history prepared", "request_player_id", req.PlayerID, "filter_player_id", query.PlayerID, "symbol", query.Symbol, "count", len(trades), "limit", query.Limit)
 	return marshalJSON(map[string]any{
 		"type":    "trade.history",
 		"filters": payload,
@@ -68,6 +69,7 @@ func (e *Engine) handleLeaderboard(req ExecuteActionRequest) (string, error) {
 	}
 	now := time.Now().UTC()
 	entries := e.performance.Leaderboard(time.Duration(payload.WindowSeconds)*time.Second, now, e.tradeHistory.All(), payload.Limit)
+	e.logger.Info("leaderboard prepared", "request_player_id", req.PlayerID, "window_seconds", payload.WindowSeconds, "limit", payload.Limit, "entries", len(entries))
 	return marshalJSON(map[string]any{
 		"type":           "stats.leaderboard",
 		"window_seconds": payload.WindowSeconds,
@@ -107,6 +109,7 @@ func (e *Engine) persistTradeEffects(players map[string]*state.Player, trades []
 		if err := e.tradeHistory.Append(records); err != nil {
 			return err
 		}
+		e.logger.Info("trade effects persisted", "trades", len(trades), "players", len(players))
 	}
 	return e.recordPerformanceSnapshots(players)
 }
@@ -130,6 +133,7 @@ func (e *Engine) recordPerformanceSnapshots(players map[string]*state.Player) er
 	if err != nil {
 		return err
 	}
+	e.logger.Info("performance snapshots built", "players", len(players), "snapshots", len(snapshots))
 	return e.performance.Append(snapshots)
 }
 
